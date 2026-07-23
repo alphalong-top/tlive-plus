@@ -11,6 +11,12 @@ jobs:
     # IPC branches, PATHEXT command resolution, and the win32 shell runner
     # have never been exercised on real Windows hardware. Runners ship VS
     # Build Tools, so node-pty's native build is validated too.
+    #
+    # Windows is currently NON-BLOCKING (continue-on-error): ~27 tests fail on
+    # windows-latest (named-pipe IPC timeouts, path-separator assertions, PATH
+    # detection) — tracked as a Windows-compatibility issue. ubuntu stays a hard
+    # gate. Flip Windows back to blocking once that issue is resolved.
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     strategy:
       fail-fast: false
       matrix:

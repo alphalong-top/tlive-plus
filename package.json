@@ -1,0 +1,71 @@
+{
+  "name": "tlive",
+  "version": "2.0.0",
+  "description": "Vendor-neutral, self-hosted remote-approval + live-monitoring layer for Claude Code / Codex (Telegram, Feishu, web terminal + dashboard)",
+  "type": "module",
+  "bin": {
+    "tlive": "./dist/src/tlive-cli.mjs"
+  },
+  "files": [
+    "scripts/build.mjs",
+    "scripts/postinstall.js",
+    "scripts/preuninstall.js",
+    "dist/",
+    "src/",
+    "references/",
+    "config.env.example",
+    "plugins/"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "ci": "npm run typecheck && npm test && npm run build",
+    "postinstall": "node scripts/postinstall.js",
+    "preuninstall": "node scripts/preuninstall.js",
+    "prepublishOnly": "npm run ci"
+  },
+  "keywords": [
+    "terminal",
+    "monitoring",
+    "claude-code",
+    "codex",
+    "telegram",
+    "feishu",
+    "remote-approval",
+    "ai-coding",
+    "remote-terminal"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/y49/tlive"
+  },
+  "dependencies": {
+    "@grammyjs/runner": "^2.0.3",
+    "@grammyjs/transformer-throttler": "^1.2.1",
+    "@larksuiteoapi/node-sdk": "^1.59.0",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/addon-serialize": "^0.14.0",
+    "@xterm/addon-web-links": "^0.12.0",
+    "@xterm/headless": "^6.0.0",
+    "@xterm/xterm": "^6.0.0",
+    "grammy": "^1.41.1",
+    "https-proxy-agent": "^9.0.0",
+    "node-pty": "^1.1.0",
+    "qrcode-terminal": "^0.12.0",
+    "socks-proxy-agent": "^10.0.0",
+    "ws": "^8.20.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.2",
+    "@types/ws": "^8.18.1",
+    "esbuild": "^0.27.7",
+    "typescript": "^6.0.2",
+    "vitest": "^4.1.3"
+  }
+}

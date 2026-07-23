@@ -8,15 +8,10 @@ on:
 jobs:
   test:
     # windows-latest is the project's only Windows coverage: the named-pipe
-    # IPC branches, PATHEXT command resolution, and the win32 shell runner
-    # have never been exercised on real Windows hardware. Runners ship VS
-    # Build Tools, so node-pty's native build is validated too.
-    #
-    # Windows is currently NON-BLOCKING (continue-on-error): ~27 tests fail on
-    # windows-latest (named-pipe IPC timeouts, path-separator assertions, PATH
-    # detection) — tracked as a Windows-compatibility issue. ubuntu stays a hard
-    # gate. Flip Windows back to blocking once that issue is resolved.
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
+    # IPC branches, PATHEXT command resolution, and the win32 shell runner.
+    # Runners ship VS Build Tools, so node-pty's native build is validated too.
+    # Both OSes are hard gates; win32-only test retry (vitest.config.ts) absorbs
+    # shared-runner named-pipe timing jitter without masking Linux regressions.
     strategy:
       fail-fast: false
       matrix:

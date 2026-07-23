@@ -114,17 +114,21 @@ export async function startIpcServer(opts: {
   });
   return {
     async close() {
-      // Gracefully END connections first (flush any buffered reply — e.g. the
-      // daemon's settle-on-shutdown replies — then FIN) rather than destroy,
-      // which would discard those pending writes and make the shim's request()
-      // see an abrupt close (IpcConnectionClosedError). Give the reply a moment
-      // to round-trip (Windows named pipes are slower), THEN force-destroy any
-      // straggler so server.close() can never hang, and unlink.
+      // Gracefully END connections (flush any buffered reply — e.g. the daemon's
+      // settle-on-shutdown replies — then FIN), then let server.close() wait for
+      // them to drain naturally: each client reads its reply, resolves, and
+      // closes on its own. Destroying instead would discard in-transit replies
+      // and make the shim's request() see an abrupt close (IpcConnectionClosed)
+      // — the exact Windows-named-pipe race under load. A 500ms safety net
+      // force-closes any genuine straggler so close() can never hang.
       for (const s of sockets) s.end();
-      await new Promise((r) => setTimeout(r, 50));
-      for (const s of sockets) s.destroy();
+      await new Promise<void>((resolve) => {
+        let settled = false;
+        const finish = (): void => { if (!settled) { settled = true; resolve(); } };
+        server.close(() => finish());
+        setTimeout(() => { for (const s of sockets) s.destroy(); finish(); }, 500).unref();
+      });
       sockets.clear();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
       if (!isPipePath(opts.path) && existsSync(opts.path)) unlinkSync(opts.path);
     },
   };

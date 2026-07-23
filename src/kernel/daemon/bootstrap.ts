@@ -785,7 +785,11 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
     const forceExit = setTimeout(() => {
       // eslint-disable-next-line no-console
       console.error('tlive daemon: forced exit (event loop did not drain in 2s)');
-      process.exit(0);
+      // Real-daemon safety net only. Under vitest (embedded bootstrapDaemon),
+      // a slow teardown — e.g. the Windows runner's named-pipe ipc.close() —
+      // must NOT call process.exit: it aborts the whole test process. The
+      // awaited shutdown below still completes cleanly on its own.
+      if (!process.env.VITEST) process.exit(0);
     }, 2000);
     forceExit.unref();
     try {

@@ -1,0 +1,16 @@
+# Normalize line endings to LF on every platform. Without this, Windows
+# checkouts (autocrlf) convert text files to CRLF, which breaks byte-exact and
+# regex-based tests — notably the plugin content-lock hash and the
+# manual-hooks.md fenced-block parse in plugin-consistency.test.ts.
+* text=auto eol=lf
+
+# Binary assets — never touch.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.ttf binary

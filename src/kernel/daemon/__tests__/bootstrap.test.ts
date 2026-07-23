@@ -291,9 +291,16 @@ describe('AskUserQuestion remote card (Task 9)', () => {
     adapter.fire({ channel: 'telegram', chatId: 'c1', userId: 'u1', messageId: 'x1', text: pickBlue.id, ts: 0 });
     await pending;
 
-    expect(edits).toHaveLength(1);
-    const editedTitle = (edits[0].msg as { title?: string }).title ?? '';
-    expect(editedTitle).toContain('Answered');
+    // The settle-edit ("Answered") lands asynchronously relative to the wire
+    // reply; on slower transports (Windows named pipes) it can arrive just
+    // after `pending` resolves, sometimes behind an intermediate edit. Assert
+    // the FINAL edit rather than assuming it's the first/only one (mirrors the
+    // multi-select test below).
+    await vi.waitFor(() => {
+      const t = (edits.at(-1)?.msg as { title?: string })?.title ?? '';
+      expect(t).toContain('Answered');
+    }, { timeout: 3000, interval: 20 });
+    const editedTitle = (edits.at(-1)!.msg as { title?: string }).title ?? '';
     expect(editedTitle).not.toContain('Denied');
   });
 

@@ -1,9 +1,14 @@
 import { describe, it, expect } from 'vitest';
 import { createConnection } from 'node:net';
 import { mkdtempSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, basename } from 'node:path';
 import { tmpdir } from 'node:os';
 import { SessionHost, authoritativeSize } from '../session-host';
+
+// Per-session socket: fs path on POSIX (directly in `dir`, no subdir), named
+// pipe on win32. basename(dir) is unique per mkdtemp → collision-free pipe.
+const sessSock = (dir: string, name: string): string =>
+  process.platform === 'win32' ? `\\\\.\\pipe\\tlive-t-${basename(dir)}-${name}` : join(dir, `${name}.sock`);
 import { FrameDecoder, FrameType, encodeAttach, encodeData, parseDims } from '../../web/stream-protocol.js';
 
 describe('authoritativeSize', () => {
@@ -34,7 +39,7 @@ describe('authoritativeSize', () => {
 describe('SessionHost (socket-only, attachLocal:false)', () => {
   it('forwards client input into the pty and fans pty output back as data frames', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'tlive-host-'));
-    const sockPath = join(dir, 's.sock');
+    const sockPath = sessSock(dir, 's');
     // cross-platform echoer: node piping stdin → stdout
     const host = new SessionHost({
       id: 't1',
@@ -71,7 +76,7 @@ describe('SessionHost (socket-only, attachLocal:false)', () => {
 
   it('pty size follows the last client that typed and broadcasts it to all clients', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'tlive-host-'));
-    const sockPath = join(dir, 's.sock');
+    const sockPath = sessSock(dir, 's');
     // quiet pty: reads stdin (so input is consumed) but never echoes; stays alive.
     const host = new SessionHost({
       id: 't2', cmd: process.execPath,
@@ -124,7 +129,7 @@ describe('SessionHost (socket-only, attachLocal:false)', () => {
 
   it('late joiner receives a snapshot of the screen printed BEFORE it attached', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'tlive-host-'));
-    const sockPath = join(dir, 's.sock');
+    const sockPath = sessSock(dir, 's');
     // prints once at startup, then stays alive silently
     const host = new SessionHost({
       id: 't3',
@@ -161,7 +166,7 @@ describe('SessionHost (socket-only, attachLocal:false)', () => {
 
   it('injects TLIVE_SESSION=<id> into the wrapped process env', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'tlive-host-'));
-    const sockPath = join(dir, 's.sock');
+    const sockPath = sessSock(dir, 's');
     const host = new SessionHost({
       id: 'env-1',
       cmd: process.execPath,
@@ -194,7 +199,7 @@ describe('SessionHost (socket-only, attachLocal:false)', () => {
 
   it('reports running on output then idle after silence', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'tlive-host-'));
-    const sockPath = join(dir, 's.sock');
+    const sockPath = sessSock(dir, 's');
     // print once at start, then go silent
     const host = new SessionHost({
       id: 'act-1', cmd: process.execPath,

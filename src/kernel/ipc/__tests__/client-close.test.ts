@@ -9,7 +9,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer, type Server, type Socket } from 'node:net';
-import { request } from '../client';
+import { request, daemonSocketPath } from '../client';
 
 let cleanup: Array<() => void> = [];
 afterEach(() => { cleanup.forEach((f) => f()); cleanup = []; });
@@ -17,7 +17,8 @@ afterEach(() => { cleanup.forEach((f) => f()); cleanup = []; });
 const mkSock = (): string => {
   const dir = mkdtempSync(join(tmpdir(), 'tlive-ipc-close-'));
   cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
-  return join(dir, 'daemon.sock');
+  return daemonSocketPath(dir); // fs path on POSIX, named pipe on win32
+
 };
 
 /** Raw net server (deliberately NOT startIpcServer) so the test controls

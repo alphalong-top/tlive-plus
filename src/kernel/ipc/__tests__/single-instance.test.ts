@@ -3,7 +3,9 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { startIpcServer, AlreadyRunningError, waitUntilSocketFree, type IpcServer } from '../server';
-import { request } from '../client';
+import { request, daemonSocketPath } from '../client';
+
+const isWin = process.platform === 'win32';
 
 describe('startIpcServer single-instance', () => {
   const dirs: string[] = [];
@@ -15,10 +17,13 @@ describe('startIpcServer single-instance', () => {
   const sockIn = (): string => {
     const d = mkdtempSync(join(tmpdir(), 'tlive-si-'));
     dirs.push(d);
-    return join(d, 'ipc.sock');
+    return daemonSocketPath(d); // fs path on POSIX, named pipe on win32
   };
 
-  it('stale socket 文件被清理后正常 listen', async () => {
+  // Windows named pipes aren't filesystem entries, so there is no "stale socket
+  // FILE" to clean up (writeFileSync to a \\.\pipe\ path fails) — this scenario
+  // is POSIX-only by design (isPipePath guards the unlink in server.ts).
+  it.skipIf(isWin)('stale socket 文件被清理后正常 listen', async () => {
     const p = sockIn();
     writeFileSync(p, ''); // 假 stale 文件
     const s = await startIpcServer({ path: p, handler: (_r, reply) => reply({ kind: 'daemon.status', pid: 1, uptimeMs: 0 } as any) });
@@ -47,7 +52,7 @@ describe('waitUntilSocketFree (stop;start takeover)', () => {
   const sockIn = (): string => {
     const d = mkdtempSync(join(tmpdir(), 'tlive-wf-'));
     dirs.push(d);
-    return join(d, 'ipc.sock');
+    return daemonSocketPath(d); // fs path on POSIX, named pipe on win32
   };
 
   it('resolves true once a dying server releases the socket — the new daemon can take over', async () => {

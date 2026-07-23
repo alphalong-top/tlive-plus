@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createConnection } from 'node:net';
 import { startIpcServer, type IpcServer } from '../server';
-import { request } from '../client';
+import { request, daemonSocketPath } from '../client';
 
 let cleanup: Array<() => void> = [];
 afterEach(() => { cleanup.forEach((f) => f()); cleanup = []; });
@@ -12,7 +12,8 @@ afterEach(() => { cleanup.forEach((f) => f()); cleanup = []; });
 const mkSock = (): string => {
   const dir = mkdtempSync(join(tmpdir(), 'tlive-ipc-'));
   cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
-  return join(dir, 'x.sock');
+  return daemonSocketPath(dir); // fs path on POSIX, named pipe on win32
+
 };
 
 describe('IpcCallContext.onDisconnect', () => {

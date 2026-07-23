@@ -1,9 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, basename } from 'node:path';
 import { tmpdir } from 'node:os';
 import { deriveLabel, gitBranch, ensureDaemonUp } from '../run';
 import { startIpcServer, type IpcServer } from '../../../kernel/ipc/server';
+import { daemonSocketPath } from '../../../kernel/ipc/client';
 
 let dir: string;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'tlive-run-')); });
@@ -32,7 +33,7 @@ describe('ensureDaemonUp (run 懒启动)', () => {
 
   it('daemon 已在 → true,不调 autoStart', async () => {
     const home = tmp();
-    const sock = join(home, 'ipc.sock');
+    const sock = daemonSocketPath(home);
     servers.push(await startIpcServer({ path: sock, handler: statusHandler as never }));
     let called = 0;
     expect(await ensureDaemonUp(home, sock, () => { called++; return true; })).toBe(true);
@@ -42,13 +43,13 @@ describe('ensureDaemonUp (run 懒启动)', () => {
   it('daemon 不在 + autoStart 返回 false(禁用)→ false,不轮询等待', async () => {
     const home = tmp();
     const t0 = Date.now();
-    expect(await ensureDaemonUp(home, join(home, 'ipc.sock'), () => false)).toBe(false);
+    expect(await ensureDaemonUp(home, daemonSocketPath(home), () => false)).toBe(false);
     expect(Date.now() - t0).toBeLessThan(2500); // 只有一次探活,没有 3s 轮询
   });
 
   it('daemon 不在 + autoStart 拉起(注入:直接起一个 IPC server)→ 轮询后 true', async () => {
     const home = tmp();
-    const sock = join(home, 'ipc.sock');
+    const sock = daemonSocketPath(home);
     expect(await ensureDaemonUp(home, sock, () => {
       void startIpcServer({ path: sock, handler: statusHandler as never }).then((s) => servers.push(s));
       return true;
@@ -63,6 +64,6 @@ describe('deriveLabel', () => {
   it('appends the git branch when present', () => {
     mkdirSync(join(dir, '.git'), { recursive: true });
     writeFileSync(join(dir, '.git', 'HEAD'), 'ref: refs/heads/main\n');
-    expect(deriveLabel('codex', dir)).toBe(`codex @ ${join(dir).split('/').filter(Boolean).pop()} (main)`);
+    expect(deriveLabel('codex', dir)).toBe(`codex @ ${basename(dir)} (main)`);
   });
 });

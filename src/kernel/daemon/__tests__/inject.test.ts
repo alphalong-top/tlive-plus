@@ -1,9 +1,15 @@
 import { describe, it, expect } from 'vitest';
 import { mkdtempSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, basename } from 'node:path';
 import { tmpdir } from 'node:os';
 import { SessionHost } from '../../pty/session-host.js';
 import { bracketedPaste, injectInput } from '../inject.js';
+
+// Per-session socket: a filesystem path on POSIX (kept directly in `dir`, no
+// subdir), a named pipe on win32 (which has no unix sockets). basename(dir) is
+// unique per mkdtemp, keeping the pipe name collision-free across tests.
+const sessSock = (dir: string, name: string): string =>
+  process.platform === 'win32' ? `\\\\.\\pipe\\tlive-t-${basename(dir)}-${name}` : join(dir, `${name}.sock`);
 
 describe('bracketedPaste', () => {
   it('wraps text in paste markers and appends Enter', () => {
@@ -26,7 +32,7 @@ describe('bracketedPaste', () => {
 describe('injectInput', () => {
   it('delivers text into the pty via the per-session socket', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'tlive-inj-'));
-    const sockPath = join(dir, 's.sock');
+    const sockPath = sessSock(dir, 'i1');
     // echo stdin back to stdout so we can observe delivery
     const host = new SessionHost({
       id: 'i1', cmd: process.execPath, args: ['-e', 'process.stdin.pipe(process.stdout)'],
@@ -60,6 +66,6 @@ describe('injectInput', () => {
   });
 
   it('rejects when the socket is gone', async () => {
-    await expect(injectInput(join(tmpdir(), 'nope-xyz.sock'), 'x', 500)).rejects.toThrow();
+    await expect(injectInput(sessSock(tmpdir(), 'nope-xyz'), 'x', 500)).rejects.toThrow();
   });
 });

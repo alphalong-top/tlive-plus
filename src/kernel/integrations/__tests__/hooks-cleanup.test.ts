@@ -11,10 +11,15 @@ describe('commandOnPath', () => {
     const { commandOnPath } = await import('../hooks-cleanup');
     const dir = mkdtempSync(join(tmpdir(), 'tlive-path-'));
     dirs.push(dir);
-    const exe = join(dir, 'tlivefakebin');
-    writeFileSync(exe, '#!/bin/sh\n');
-    const { chmodSync } = await import('node:fs');
-    chmodSync(exe, 0o755);
+    // On win32 an executable is resolved via PATHEXT (.EXE/.CMD/.BAT), so an
+    // extensionless file wouldn't be "on PATH" the way it is on POSIX.
+    const isWin = process.platform === 'win32';
+    const exe = join(dir, isWin ? 'tlivefakebin.cmd' : 'tlivefakebin');
+    writeFileSync(exe, isWin ? '@echo off\r\n' : '#!/bin/sh\n');
+    if (!isWin) {
+      const { chmodSync } = await import('node:fs');
+      chmodSync(exe, 0o755);
+    }
     const prevPath = process.env.PATH;
     process.env.PATH = dir + (process.platform === 'win32' ? ';' : ':') + (prevPath ?? '');
     try {

@@ -2,9 +2,13 @@
 import { describe, it, expect } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { mkdtempSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, basename } from 'node:path';
 import { tmpdir } from 'node:os';
 import * as net from 'node:net';
+
+// Per-session socket: fs path on POSIX, named pipe on win32 (no unix sockets).
+const sessSock = (dir: string, name: string): string =>
+  process.platform === 'win32' ? `\\\\.\\pipe\\tlive-t-${basename(dir)}-${name}` : join(dir, `${name}.sock`);
 import { bridge } from '../pty-bridge.js';
 import { SessionHost } from '../../pty/session-host.js';
 import { FrameDecoder, FrameType, encodeAttach, encodeData, encodeSize, parseDims } from '../stream-protocol.js';
@@ -21,7 +25,7 @@ class FakeWs extends EventEmitter {
 describe('PtyBridge', () => {
   it('pumps bytes both ways between a ws and a session socket', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'tlive-bridge-'));
-    const sockPath = join(dir, 's.sock');
+    const sockPath = sessSock(dir, 's');
     const host = new SessionHost({
       id: 'b1', cmd: process.execPath, args: ['-e', 'process.stdin.pipe(process.stdout)'],
       cwd: dir, sockPath, attachLocal: false,
@@ -55,7 +59,7 @@ describe('PtyBridge', () => {
 
   it('passes a server→client Size frame through to the ws untouched', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'tlive-bridge-size-'));
-    const sockPath = join(dir, 'size.sock');
+    const sockPath = sessSock(dir, 'size');
 
     // Stand up a minimal unix socket server that sends a Size frame on connect.
     const server = net.createServer((sock) => {

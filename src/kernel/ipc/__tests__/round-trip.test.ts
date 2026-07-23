@@ -3,7 +3,7 @@ import { mkdtempSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { startIpcServer, type IpcServer } from '../server';
-import { request } from '../client';
+import { request, daemonSocketPath } from '../client';
 import type { IpcRequest, IpcResponse } from '../protocol';
 
 let tmp: string;
@@ -12,7 +12,7 @@ let server: IpcServer;
 
 beforeEach(async () => {
   tmp = mkdtempSync(join(tmpdir(), 'tlive-ipc-'));
-  sock = join(tmp, 'daemon.sock');
+  sock = daemonSocketPath(tmp); // fs path on POSIX, named pipe on win32
 });
 
 afterEach(async () => { await server?.close(); });

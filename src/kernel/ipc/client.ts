@@ -2,7 +2,7 @@
 
 import { createConnection } from 'node:net';
 import { createHash } from 'node:crypto';
-import { join } from 'node:path';
+import { join, posix } from 'node:path';
 import { homedir } from 'node:os';
 import type { IpcRequest, IpcResponse } from './protocol.js';
 
@@ -17,7 +17,9 @@ export function daemonSocketPath(home: string, platform: NodeJS.Platform = proce
     const tag = createHash('sha256').update(home).digest('hex').slice(0, 12);
     return `\\\\.\\pipe\\tlive-daemon-${tag}`;
   }
-  return join(home, 'daemon.sock');
+  // posix.join (not join) so the `platform` arg is honored on a win32 runtime
+  // too — the non-win32 branch must yield a POSIX path regardless of the host.
+  return posix.join(home, 'daemon.sock');
 }
 
 export function defaultSocketPath(): string {

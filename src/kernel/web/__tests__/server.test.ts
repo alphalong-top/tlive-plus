@@ -1,8 +1,12 @@
 // src/kernel/web/__tests__/server.test.ts
 import { describe, it, expect, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, basename } from 'node:path';
 import { tmpdir } from 'node:os';
+
+// Per-session socket: fs path on POSIX, named pipe on win32 (no unix sockets).
+const sessSock = (dir: string, name: string): string =>
+  process.platform === 'win32' ? `\\\\.\\pipe\\tlive-t-${basename(dir)}-${name}` : join(dir, `${name}.sock`);
 import { WebSocket } from 'ws';
 import { startWebServer, type WebServerHandle } from '../server.js';
 import { SessionRegistry } from '../session-registry.js';
@@ -32,7 +36,7 @@ describe('WebServer', () => {
 
   it('attaches a ws client to a session and echoes through the bridge', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'tlive-ws-'));
-    const sockPath = join(dir, 's.sock');
+    const sockPath = sessSock(dir, 'w1');
     host = new SessionHost({ id: 'w1', cmd: process.execPath, args: ['-e', 'process.stdin.pipe(process.stdout)'], cwd: dir, sockPath, attachLocal: false });
     await host.start();
     const sessions = new SessionRegistry();

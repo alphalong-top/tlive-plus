@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
+import { join } from 'node:path';
 import { ensureCodexAppServer, codexAppServerSockPath } from '../spawn.js';
 
 const fakeChild = () => Object.assign(new EventEmitter(), { pid: 42, kill: vi.fn() });
@@ -77,7 +78,7 @@ describe('ensureCodexAppServer', () => {
     expect(states).toEqual(['running']);
   });
   it('sock path honors CODEX_HOME arg', () => {
-    expect(codexAppServerSockPath('/ch')).toBe('/ch/app-server-control/app-server-control.sock');
+    expect(codexAppServerSockPath('/ch')).toBe(join('/ch', 'app-server-control', 'app-server-control.sock'));
   });
   it('returns null on win32', async () => {
     const c = await ensureCodexAppServer({ logPath: '/tmp/x.log', probe: async () => true, platform: 'win32', hasCodex: () => true });

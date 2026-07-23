@@ -114,11 +114,14 @@ export async function startIpcServer(opts: {
   });
   return {
     async close() {
-      // Force-close lingering connections before server.close(). Otherwise
-      // server.close() waits on them, and any in-flight client request on such
-      // a connection surfaces later as an unhandled 'ipc timeout' (seen on the
-      // Windows runner's named pipes). Destroying settles the client promptly
-      // via 'close' and stops teardown writes that would EAGAIN on a full pipe.
+      // Gracefully END connections first (flush any buffered reply — e.g. the
+      // daemon's settle-on-shutdown replies — then FIN) rather than destroy,
+      // which would discard those pending writes and make the shim's request()
+      // see an abrupt close (IpcConnectionClosedError). Give the reply a moment
+      // to round-trip (Windows named pipes are slower), THEN force-destroy any
+      // straggler so server.close() can never hang, and unlink.
+      for (const s of sockets) s.end();
+      await new Promise((r) => setTimeout(r, 50));
       for (const s of sockets) s.destroy();
       sockets.clear();
       await new Promise<void>((resolve) => server.close(() => resolve()));

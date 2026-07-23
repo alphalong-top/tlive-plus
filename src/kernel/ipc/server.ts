@@ -63,11 +63,14 @@ export async function startIpcServer(opts: {
     if (await isSocketAlive(opts.path)) throw new AlreadyRunningError();
     unlinkSync(opts.path); // stale leftover from a dead daemon
   }
+  const sockets = new Set<Socket>();
   const server: Server = createServer((sock: Socket) => {
+    sockets.add(sock);
     // Suppress EPIPE / ECONNRESET from writes to a disconnected socket.
     sock.on('error', () => {});
     const disconnectCbs: Array<() => void> = [];
     sock.on('close', () => {
+      sockets.delete(sock);
       for (const cb of disconnectCbs.splice(0)) {
         try { cb(); } catch { /* 一个回调抛出不得影响其它 */ }
       }
@@ -111,6 +114,13 @@ export async function startIpcServer(opts: {
   });
   return {
     async close() {
+      // Force-close lingering connections before server.close(). Otherwise
+      // server.close() waits on them, and any in-flight client request on such
+      // a connection surfaces later as an unhandled 'ipc timeout' (seen on the
+      // Windows runner's named pipes). Destroying settles the client promptly
+      // via 'close' and stops teardown writes that would EAGAIN on a full pipe.
+      for (const s of sockets) s.destroy();
+      sockets.clear();
       await new Promise<void>((resolve) => server.close(() => resolve()));
       if (!isPipePath(opts.path) && existsSync(opts.path)) unlinkSync(opts.path);
     },

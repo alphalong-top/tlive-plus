@@ -186,6 +186,18 @@ export class PermissionRouter {
     return this.pending.size;
   }
 
+  /** Graceful shutdown: resolve every held request as pass-through `defer`
+   *  (CC-native fallback, the safe direction — never auto-decides). The caller
+   *  (shim) then gets a clean reply and resolves normally, instead of its
+   *  connection being abruptly destroyed and rejecting. Call BEFORE ipc.close()
+   *  and let the replies flush. */
+  settleAllPending(): void {
+    for (const [id, entry] of this.pending) {
+      this.pending.delete(id);
+      entry.resolve({ decision: 'defer' });
+    }
+  }
+
   /** 返回 true = 命中并已 resolve;false = 无此 pending(卡已 stale:daemon
    *  重启 / 已超时 / 会话已结束)。调用方据此告知用户,而非静默丢弃。
    *  updatedInput:AskUserQuestion 作答走 approved=true(allow)+ updatedInput

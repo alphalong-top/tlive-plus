@@ -793,6 +793,14 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
     }, 2000);
     forceExit.unref();
     try {
+      // Answer any held IPC requests FIRST (approvals → pass-through defer,
+      // continues → null) so each shim gets a clean reply and its request()
+      // resolves — otherwise ipc.close() destroys the connection out from under
+      // an in-flight request and it rejects (IpcConnectionClosedError). Flush a
+      // tick so the replies write out before we start closing.
+      permissionRouter.settleAllPending();
+      continueBroker.settleAllPending();
+      await new Promise((r) => setImmediate(r));
       codexCompanion?.stop();
       custody?.stop();
       for (const a of opts.imAdapters ?? []) await a.stop();

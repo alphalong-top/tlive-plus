@@ -40,4 +40,14 @@ export class ContinueBroker {
     r(reply);
     return true;
   }
+
+  /** Graceful shutdown: resolve every held request as null (= normal stop) so
+   *  the caller gets a clean reply and resolves, instead of its connection being
+   *  destroyed and rejecting. Call before ipc.close() and let replies flush. */
+  settleAllPending(): void {
+    for (const [id, resolve] of this.pending) {
+      this.pending.delete(id);
+      resolve(null);
+    }
+  }
 }

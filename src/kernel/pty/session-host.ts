@@ -12,6 +12,7 @@ import { Terminal as HeadlessTerminal } from '@xterm/headless';
 import { SerializeAddon } from '@xterm/addon-serialize';
 import { isPipePath } from '../ipc/client.js';
 import { FrameDecoder, FrameType, encodeData, encodeSize, parseDims } from '../web/stream-protocol.js';
+import { guardWindowsConinSocket } from './win-conin-guard.js';
 
 export interface SessionHostOpts {
   id: string;
@@ -57,7 +58,7 @@ export class SessionHost {
   private shadow: HeadlessTerminal | null = null;
   private serializer: SerializeAddon | null = null;
   // Vendor-neutral activity: recent pty output = running, silence = idle.
-  private lastOutputAt = Date.now();
+  private lastOutputAt: number | null = null;
   private activeState: boolean | null = null;
   private activityTimer: ReturnType<typeof setInterval> | null = null;
   private onActivityCb: ((active: boolean) => void) | null = null;
@@ -84,6 +85,9 @@ export class SessionHost {
       // lets scripts detect the wrapper and lets `tlive run` refuse to nest.
       env: { ...(this.opts.env ?? process.env), TLIVE_SESSION: this.opts.id } as Record<string, string>,
     });
+    // node-pty leaves the win32 conin socket without an 'error' listener; an
+    // unguarded write failure there is an uncaught exception. See the module.
+    guardWindowsConinSocket(this.pty);
 
     this.shadow = new HeadlessTerminal({ cols: size.cols, rows: size.rows, scrollback: 1000, allowProposedApi: true });
     this.serializer = new SerializeAddon();
@@ -101,13 +105,15 @@ export class SessionHost {
     });
 
     this.pty.onExit(({ exitCode }) => {
+      // The child is gone; drop the handle so nothing can write to it.
+      this.pty = null;
       this.cleanup();
       this.onExitCb?.(exitCode);
     });
 
     // Poll output-activity; report only on a running↔idle flip.
     this.activityTimer = setInterval(() => {
-      const active = Date.now() - this.lastOutputAt < SessionHost.IDLE_MS;
+      const active = this.lastOutputAt !== null && Date.now() - this.lastOutputAt < SessionHost.IDLE_MS;
       if (active !== this.activeState) { this.activeState = active; this.onActivityCb?.(active); }
     }, 1000);
     this.activityTimer.unref?.();
@@ -141,7 +147,16 @@ export class SessionHost {
 
   async stop(): Promise<void> {
     this.cleanup();
-    try { this.pty?.kill(); } catch { /* already dead */ }
+    this.disposePty();
+  }
+
+  /** Kill the child and drop the handle. Every write/resize site uses `this.pty?.`,
+   *  so clearing it makes late input a no-op instead of a write to a dead pipe. */
+  private disposePty(): void {
+    const pty = this.pty;
+    this.pty = null;
+    if (!pty) return;
+    try { pty.kill(); } catch { /* already dead */ }
   }
 
   private onLocalInput = (chunk: Buffer): void => {

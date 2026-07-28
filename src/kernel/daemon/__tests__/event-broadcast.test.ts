@@ -7,6 +7,7 @@ import { WebSocket } from 'ws';
 import { bootstrapDaemon, type DaemonHandle } from '../bootstrap.js';
 import { request } from '../../ipc/client.js';
 import type { IMAdapter, IMChannel, OutgoingMessage, IncomingEnvelope } from '../../contracts/im-adapter.js';
+import { until } from '../../__tests__/wait.js';
 
 let tmp: string;
 let h: DaemonHandle;
@@ -109,8 +110,7 @@ describe('daemon → /ws/events downstream broadcast', () => {
     expect(f.session.lastMessage).toBe('last_msg');
 
     // Effect 2: ContinueBroker received the request → IM message sent containing requestId.
-    await new Promise((r) => setTimeout(r, 100));
-    expect(capturedMsg).toMatch(/last_msg/); // excerpt = 真正的最后一句
+    await until(() => { expect(capturedMsg).toMatch(/last_msg/); }); // excerpt = the actual last message
     // requestId no longer appears in the display text — take it from the registry
     const continueId = h.sessions.get('s')!.continueId!;
     expect(continueId).toMatch(/[a-f0-9-]{36}/);
@@ -182,20 +182,22 @@ describe('daemon → /ws/events downstream broadcast', () => {
     const f = await waitFor(frames, (x) => x.type === 'session-upsert' && x.session.id === 's2' && x.session.status === 'waiting-approval');
     const rid = f.session.pending.requestId;
     expect(f.session.pending.ask).toMatchObject({ question: 'First?', index: 0, total: 2 });
-    await new Promise((r) => setTimeout(r, 100));
-    const first = sentIm[0] as { title?: string; body: string };
-    expect(first.title).toContain('Question 1/2');
+    await until(() => {
+      expect(sentIm[0]).toBeDefined();
+      expect((sentIm[0] as { title?: string })?.title).toContain('Question 1/2');
+    });
 
     // Answer question 1 from the dashboard — the batch must NOT resolve yet,
     // and BOTH surfaces must move to question 2.
     ws.send(JSON.stringify({ type: 'ask', requestId: rid, picks: [0] }));
     const second = await waitFor(frames, (x) => x.type === 'session-upsert' && x.session.id === 's2' && x.session.pending?.ask?.index === 1);
     expect(second.session.pending.ask).toMatchObject({ question: 'Second?', index: 1, total: 2 });
-    await new Promise((r) => setTimeout(r, 100));
+    await until(() => {
+      expect((edits.at(-1) as { title?: string } | undefined)?.title).toContain('Question 2/2');
+    });
     // The IM card follows the dashboard: title progress AND body, not just one
     // of them (the badge froze at "Question 1/2" while the body moved on).
     const edited = edits.at(-1) as { title?: string; body: string; buttons?: Array<{ id: string }> };
-    expect(edited.title).toContain('Question 2/2');
     expect(edited.body).toContain('Second?');
     expect(edited.buttons?.map((b) => b.id)).toContain(`askback:${rid}`);
 
@@ -225,8 +227,7 @@ describe('daemon → /ws/events downstream broadcast', () => {
     );
     const f = await waitFor(frames, (x) => x.type === 'session-upsert' && x.session.id === 's' && x.session.status === 'waiting-approval');
     expect(f.session.pending.ask).toEqual({ question: 'Pick a color?', options: [{ label: 'Red' }, { label: 'Blue' }], multiSelect: false, index: 0, total: 1 });
-    await new Promise((r) => setTimeout(r, 100));
-    expect(sentIm).toHaveLength(1); // IM still gets the ask card with option buttons
+    await until(() => { expect(sentIm).toHaveLength(1); }); // IM still gets the ask card with option buttons
 
     // Answer from the dashboard: pick "Blue" → allow + updatedInput.answers
     // (same wire as the IM buttons — CC treats the tool as answered).
@@ -342,7 +343,26 @@ describe('daemon → /ws/events downstream broadcast', () => {
     h = await bootstrapDaemon({ home: tmp, imAdapters: [adapter] });
     const t0 = Date.now();
     const p = request({ kind: 'hook.continue.request', cwd: '/g', sessionId: 's', context: 'ctx' }, { socketPath: sock, timeoutMs: 8000 });
-    await new Promise((r) => setTimeout(r, 150));
+    // No `until()` here on purpose: this is a sequencing gate (let the request
+    // above reach the daemon's grace-registration point), not an arrival
+    // assertion, and there is no arrival to poll for. `h.sessions.get('s')`
+    // stays undefined and `continueId` is never set on THIS (suppressed) path
+    // — continueId is only ever assigned inside ContinueBroker's onRequest
+    // callback, which fires from `continueBroker.request()`, and that call is
+    // skipped entirely once `suppressed` resolves true (bootstrap.ts's
+    // 'hook.continue.request' case returns before reaching it). Waiting on
+    // continueId would hang for the full 5s `until()` timeout every run.
+    // This is the one fixed sleep in this file that has no daemon-observable
+    // substitute (the other fixed waits elsewhere in this file are deliberate
+    // absence assertions, not stand-ins for this). The margin is widened
+    // (150ms → 600ms) as the only mitigation available while the daemon
+    // exposes no grace-registration signal: too short and the suppression
+    // never arms, failing this test outright on the `toBeLessThan(4000)` below
+    // rather than merely flaking. 600ms still leaves ample room under that 4s
+    // budget. If the daemon ever exposes a grace-registration signal (e.g. a
+    // test-only callback off `bootstrapDaemon`/`DaemonHandle`), convert this to
+    // an `until()` on it instead.
+    await new Promise((r) => setTimeout(r, 600));
     // user starts a new turn within the grace window → suppress the continue card
     await request({ kind: 'hook.event', event: { event: 'prompt', cwd: '/g', sessionId: 's', prompt: 'next' } }, { socketPath: sock, timeoutMs: 2000 });
     const res = (await p) as { reply: string | null };
@@ -380,15 +400,14 @@ describe('daemon → /ws/events downstream broadcast', () => {
     // seed the session so the card gets a label tag
     await request({ kind: 'hook.event', event: { event: 'session-start', cwd: '/tag/repo', sessionId: 's', source: 'startup' } }, { socketPath: sock, timeoutMs: 2000 });
     const p = request({ kind: 'hook.permission.request', cwd: '/tag/repo', sessionId: 's', toolName: 'Edit', input: { file_path: '/x', old_string: 'a', new_string: 'b' } }, { socketPath: sock, timeoutMs: 5000 });
-    await new Promise((r) => setTimeout(r, 150));
+    await until(() => { expect(sent.find((s) => s.kind === 'card')).toBeDefined(); });
     const card = sent.find((s) => s.kind === 'card');
     expect(card?.title).toContain('repo · '); // session tag prefix (still basename(cwd) — label is unaffected by the key change)
     // answer → card edited to outcome. Keyed by session id ('s'), not cwd.
     const reqId = h.sessions.get('s')!.pending!.requestId;
     await request({ kind: 'hook.permission.answer', requestId: reqId, approved: false }, { socketPath: sock, timeoutMs: 2000 });
     await p;
-    await new Promise((r) => setTimeout(r, 100));
-    expect(edits.length).toBe(1);
+    await until(() => { expect(edits.length).toBe(1); });
     expect(edits[0].title).toContain('Denied');
   });
 
@@ -458,7 +477,12 @@ describe('daemon → /ws/events downstream broadcast', () => {
     // resolve A (deny) — must NOT wipe B's pending indicator
     await request({ kind: 'hook.permission.answer', requestId: reqA, approved: false }, { socketPath: sock, timeoutMs: 2000 });
     expect(((await pA) as { decision: string }).decision).toBe('deny');
-    await new Promise((r) => setTimeout(r, 80));
+    // Invariant, not an arrival: `reqB` was read off the frame where pending had
+    // ALREADY moved to B (see the waitFor above), so this asserts that denying A
+    // did not wipe B's indicator. A condition that is already true needs real
+    // elapsed time to mean anything — until() would return on its first check and
+    // prove nothing.
+    await new Promise((r) => setTimeout(r, 200));
     expect(h.sessions.get('s')?.pending?.requestId).toBe(reqB);
     // cleanup
     await request({ kind: 'hook.permission.answer', requestId: reqB, approved: false }, { socketPath: sock, timeoutMs: 2000 });
@@ -531,8 +555,7 @@ describe('daemon → /ws/events downstream broadcast', () => {
       );
 
       await waitFor(frames, (x) => x.type === 'session-upsert' && x.session.id === 's' && x.session.lastMessage === 'Bash failed: permission denied');
-      await new Promise((r) => setTimeout(r, 100));
-      expect(sent).toHaveLength(1);
+      await until(() => { expect(sent).toHaveLength(1); });
       expect(sent[0]).toContain('permission denied');
     });
 
@@ -550,8 +573,7 @@ describe('daemon → /ws/events downstream broadcast', () => {
       );
 
       await waitFor(frames, (x) => x.type === 'session-upsert' && x.session.id === 's');
-      await new Promise((r) => setTimeout(r, 100));
-      expect(sent).toHaveLength(1);
+      await until(() => { expect(sent).toHaveLength(1); });
     });
   });
 

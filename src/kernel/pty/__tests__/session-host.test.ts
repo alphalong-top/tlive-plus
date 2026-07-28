@@ -1,15 +1,28 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterAll } from 'vitest';
 import { createConnection } from 'node:net';
 import { mkdtempSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { tmpdir } from 'node:os';
 import { SessionHost, authoritativeSize } from '../session-host';
 
+// Spied (NOT auto-mocked) for the wiring test below: on Linux
+// guardWindowsConinSocket is a no-op by design (see win-conin-guard.ts), so
+// no black-box test can see whether session-host.ts still calls it. `vi.mock`
+// is file-global and hoisted, so a plain automock would replace the guard
+// with a no-op for every OTHER test in this file too — including the ones
+// that spawn real ptys and drive real writes and kills, which is exactly
+// where a real Windows conin write failure would need swallowing. `spy: true`
+// keeps the real implementation running for all of them and only adds
+// call/return tracking on top.
+vi.mock('../win-conin-guard.js', { spy: true });
+import { guardWindowsConinSocket } from '../win-conin-guard.js';
+
 // Per-session socket: fs path on POSIX (directly in `dir`, no subdir), named
 // pipe on win32. basename(dir) is unique per mkdtemp → collision-free pipe.
 const sessSock = (dir: string, name: string): string =>
   process.platform === 'win32' ? `\\\\.\\pipe\\tlive-t-${basename(dir)}-${name}` : join(dir, `${name}.sock`);
 import { FrameDecoder, FrameType, encodeAttach, encodeData, parseDims } from '../../web/stream-protocol.js';
+import { until } from '../../__tests__/wait.js';
 
 describe('authoritativeSize', () => {
   it('defaults to 80x24 with no sources', () => {
@@ -148,26 +161,55 @@ describe('SessionHost (socket-only, attachLocal:false)', () => {
       attachLocal: false,
     });
     await host.start();
-    // let the output land in the shadow terminal before anyone attaches
-    await new Promise((r) => setTimeout(r, 400));
+
+    // A client that is already watching the session. It stays attached for the rest
+    // of the test: "late joiner" means "attached after the output happened", not
+    // "the only client" — every client gets its own snapshot on its own first attach,
+    // and the web terminal really does have tabs joining a session others are in.
+    // The error handler goes on before the first write; see the comment in the
+    // sizing test above for why.
+    const probe = createConnection(sockPath);
+    probe.on('error', () => { /* teardown race, not a test failure */ });
+    await new Promise<void>((r) => probe.once('connect', () => r()));
+    probe.write(encodeAttach(80, 24));
+
+    // The precondition the snapshot path needs: EARLY-SCREEN must have reached the
+    // shadow terminal BEFORE the client under test attaches. Otherwise the snapshot
+    // is empty, the live stream carries the string anyway, and this test passes
+    // without touching the snapshot path at all.
+    //
+    // Seeing EARLY-SCREEN arrive on a live client does NOT establish that: pty.onData
+    // broadcasts to sockets synchronously, but xterm's write buffer parses on a later
+    // macrotask, so serialize() can still return '' while those bytes are already on
+    // the wire. Wait on the shadow's own content instead — the thing the snapshot is
+    // built from. (onActivity is no use either: on Windows ConPTY emits initialisation
+    // sequences before the child writes anything, so a flip says nothing about output.)
+    const internals = host as unknown as { serializer: { serialize(): string } | null };
+    await until(() => { expect(internals.serializer?.serialize() ?? '').toContain('EARLY-SCREEN'); });
 
     const dec = new FrameDecoder();
     const got = await new Promise<string>((resolve, reject) => {
-      const t = setTimeout(() => reject(new Error('no snapshot')), 8000);
-      const chunks: Buffer[] = [];
+      const t = setTimeout(() => reject(new Error('late joiner got no snapshot')), 8000);
+      let firstDataPayload = '';
+      let gotFirstData = false;
       const sock = createConnection(sockPath, () => { sock.write(encodeAttach(80, 24)); });
       sock.on('error', reject);
       sock.on('data', (chunk: Buffer) => {
         for (const f of dec.push(chunk)) {
-          if (f.type === FrameType.Data) {
-            chunks.push(f.payload);
-            const s = Buffer.concat(chunks).toString('utf8');
-            if (s.includes('EARLY-SCREEN')) { clearTimeout(t); sock.end(); resolve(s); }
+          if (f.type === FrameType.Data && !gotFirstData) {
+            // The first Data frame on a first attach is the snapshot (serializer.serialize).
+            // Live output (from pty.onData) comes after.
+            gotFirstData = true;
+            firstDataPayload = f.payload.toString('utf8');
+            clearTimeout(t);
+            sock.end();
+            resolve(firstDataPayload);
           }
         }
       });
     });
     expect(got).toContain('EARLY-SCREEN');
+    probe.end();
     await host.stop();
   });
 
@@ -204,6 +246,32 @@ describe('SessionHost (socket-only, attachLocal:false)', () => {
     await host.stop();
   });
 
+  it.skipIf(process.platform === 'win32')('a silent child (no output) does not report as running', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'tlive-host-'));
+    const sockPath = sessSock(dir, 's');
+    // child that consumes stdin but produces no output
+    const host = new SessionHost({
+      id: 'act-silent', cmd: process.execPath,
+      args: ['-e', 'process.stdin.resume(); setInterval(()=>{},1000);'],
+      cwd: dir, sockPath, attachLocal: false,
+    });
+    const flips: boolean[] = [];
+    host.onActivity((a) => flips.push(a));
+    await host.start();
+    // Not an absence-assertion violation: the `false` flip below is a genuine
+    // arrival (the first poll tick, with no output yet, always reports idle),
+    // so until() has something real to wait on. The `not.toContain(true)`
+    // check afterwards is then made against state that can no longer change,
+    // because this test's child never writes — there is no later tick that
+    // could still flip it to running.
+    // Note: ConPTY emits initialisation sequences before any child output,
+    // so a pty with no output does not exist on Windows and the assertion
+    // is therefore meaningless rather than merely flaky. This is why the test
+    // is skipped there.
+    await until(() => { expect(flips).toContain(false); }); // a tick demonstrably ran…
+    expect(flips).not.toContain(true);                      // …and it reported idle
+    await host.stop();
+  });
 
   it('reports running on output then idle after silence', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'tlive-host-'));
@@ -217,11 +285,79 @@ describe('SessionHost (socket-only, attachLocal:false)', () => {
     const flips: boolean[] = [];
     host.onActivity((a) => flips.push(a));
     await host.start();
-    // within ~1s: running (true); after IDLE_MS(1.5s)+poll: idle (false)
-    await new Promise((r) => setTimeout(r, 3200));
-    expect(flips[0]).toBe(true);        // saw output → running
-    expect(flips).toContain(false);     // then went idle
+    // Both are arrivals — wait on each instead of a fixed sleep. (flips[0] is
+    // no longer guaranteed to be `true` by construction: it now races the
+    // child's first byte against the poll tick at spawn+~1000ms.)
+    await until(() => { expect(flips).toContain(true); });
+    await until(() => { expect(flips).toContain(false); });
     await host.stop();
+  });
+
+  // Regression: stop() killed the pty but left the handle in place, so a client
+  // Data frame already queued could still reach a pty whose win32 conin socket
+  // had just been destroyed — an uncaught 'write EAGAIN'. See #59.
+  it('clears the pty handle on stop so late input cannot reach a killed pty', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'tlive-dispose-'));
+    const host = new SessionHost({
+      id: 'd1', cmd: process.execPath, args: ['-e', 'process.stdin.pipe(process.stdout)'],
+      cwd: dir, sockPath: sessSock(dir, 'd'), attachLocal: false,
+    });
+    await host.start();
+    expect((host as unknown as { pty: unknown }).pty).not.toBeNull();
+
+    await host.stop();
+    expect((host as unknown as { pty: unknown }).pty).toBeNull();
+  });
+
+  it('clears the pty handle when the child exits on its own', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'tlive-exit-'));
+    const host = new SessionHost({
+      id: 'd2', cmd: process.execPath, args: ['-e', 'process.exit(0)'],
+      cwd: dir, sockPath: sessSock(dir, 'e'), attachLocal: false,
+    });
+    const exited = new Promise<number>((resolve) => host.onExit(resolve));
+    await host.start();
+    await exited;
+    expect((host as unknown as { pty: unknown }).pty).toBeNull();
+  });
+
+  // Regression guard for #59: guardWindowsConinSocket() is a no-op on Linux
+  // by design, so nothing black-box can tell whether start() still calls it —
+  // dropping the call here would leave the whole suite green. Assert the
+  // wiring directly via the spied import instead.
+  it('wires guardWindowsConinSocket into start()', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'tlive-guard-'));
+    const host = new SessionHost({
+      id: 'guard-1', cmd: process.execPath, args: ['-e', 'setInterval(()=>{},1000)'],
+      cwd: dir, sockPath: sessSock(dir, 'g'), attachLocal: false,
+    });
+    // Captured immediately before the action under test, not asserted as an
+    // absolute count: other tests in this file also call start() against the
+    // same spied import, so only the delta from this one call is meaningful.
+    const before = vi.mocked(guardWindowsConinSocket).mock.calls.length;
+    await host.start();
+    expect(vi.mocked(guardWindowsConinSocket).mock.calls.length).toBe(before + 1);
+    // `spy: true` runs the REAL body, not a stub, proven by the return value:
+    // an automocked function would return undefined, but the real
+    // implementation returns a platform-dependent boolean (false off win32,
+    // true on win32 once it finds a live conin socket to attach to).
+    expect(vi.mocked(guardWindowsConinSocket).mock.results.at(-1)?.value).toBe(process.platform === 'win32');
+    await host.stop();
+  });
+
+  // Confirms `spy: true` above is genuinely running the guard's own body for
+  // EVERY test in this file, not just the one above — an automocked stub
+  // would return undefined for all of them, whereas the real implementation
+  // always returns a platform-dependent boolean. If this ever fails, the
+  // guard has silently gone back to being a no-op across the whole file,
+  // which is the exact regression this test exists to catch.
+  afterAll(() => {
+    const results = vi.mocked(guardWindowsConinSocket).mock.results;
+    expect(results.length).toBeGreaterThan(1); // every SessionHost.start() above called it too
+    for (const r of results) {
+      expect(r.type).toBe('return');
+      expect(r.value).toBe(process.platform === 'win32');
+    }
   });
 
 });

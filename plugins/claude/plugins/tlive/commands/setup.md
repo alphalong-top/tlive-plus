@@ -15,7 +15,7 @@ Guide the user through tlive setup. Execute in order, showing each result:
    b. Have the user send the bot a message and confirm the reply arrives
       (proves the inbound path, not just the config).
    c. Ask the user to check the bot's command menu shows
-      /mute /trust /safe /help (a stale client cache → close and
+      /mute /trust /safe /mode /help (a stale client cache → close and
       reopen the chat).
    d. Desktop notifications: explain they fire on the computer only for things
       that need you to act — a pending approval, or the idle "waiting for your
@@ -51,7 +51,11 @@ Guide the user through tlive setup. Execute in order, showing each result:
    whether the user wants to Allow/Deny tool calls from their phone; if yes, run
    `tlive mode full` (holds each tool call for a remote answer, in parallel with
    the local prompt — first answer wins; revert any time with `tlive mode
-   notify`). If they only want monitoring, leave it in `notify`.
+   notify`). If they only want monitoring, leave it in `notify`. If they also
+   want sub-agent approvals on their phone (e.g. they're about to step away),
+   that's `tlive mode all` — flag the trade: a held sub-agent has no terminal
+   dialog until the window ends, so it only pays off when nobody is at the
+   keyboard (`tlive mode full` goes back).
 9. If status shows the Codex companion as `off` or `degraded`, explain what it
    means (codex missing from PATH / app-server child failing — see
    `~/.tlive/codex-appserver.log`); Codex approvals stay local-only until it is

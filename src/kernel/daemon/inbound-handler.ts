@@ -10,6 +10,8 @@ import type { AskFlow, AskStep } from './ask-flow.js';
 import { parseImCommand } from './im-commands.js';
 import { STALE_CARD_NOTICE } from './bootstrap.js';
 import { SAFE_TOGGLE_MESSAGE } from '../permission/policy-engine.js';
+import { MODES, MODE_DESC } from '../config/mode.js';
+import type { ShimMode } from '../hook/normalizer.js';
 
 export interface InboundHandlerDeps {
   senderGuard: SenderGuard;
@@ -25,6 +27,16 @@ export interface InboundHandlerDeps {
   setTrust: (trusted: boolean) => void;
   /** Toggle `safe` auto-approve (auto-allow non-dangerous ops; `/safe on|off`). */
   setAutoApprove: (safe: boolean) => void;
+  /** Current posture, for cards that must not lie about which rung is on. */
+  getMode: () => ShimMode;
+  /** Persist a posture (config.json — the shim reads it on the next hook). */
+  setMode: (mode: ShimMode) => void;
+  /** How many currently-held requests carry an agentId (sub-agent requests
+   *  held under the `all` posture). Gates the "leaving `all` strands
+   *  already-held sub-agent requests" notice — a card must not claim a
+   *  consequence that is not actually true, so the notice only shows when
+   *  this is > 0. */
+  heldSubagentCount: () => number;
   /** Grant "always allow <tool>" (in-memory). */
   addAllowTool: (tool: string) => void;
   /** AskUserQuestion progress for every pending request: the parsed batch, the
@@ -72,6 +84,15 @@ function parseSetCallback(text: string): { which: 'mute' | 'trust' | 'safe'; on:
   return null;
 }
 
+/** `mode:<level>` — a rung button from the ladder card (or from a sub-agent
+ *  card's one-tap posture switch). Unknown levels are ignored rather than
+ *  guessed: a posture is not something to approximate. */
+function parseModeCallback(text: string): ShimMode | null {
+  if (!text.startsWith('mode:')) return null;
+  const level = text.slice('mode:'.length);
+  return MODES.includes(level as ShimMode) ? (level as ShimMode) : null;
+}
+
 export class InboundHandler {
   constructor(private deps: InboundHandlerDeps) {}
 
@@ -111,6 +132,18 @@ export class InboundHandler {
       this.deps.addAllowTool(tool);
       if (this.deps.permissionRouter.answer(requestId, true)) {
         await this.reply(env, { kind: 'text', text: `Approved. ${tool} will be auto-allowed from now on (until daemon restart; unaffected by /trust off).` });
+      } else {
+        await this.reply(env, { kind: 'text', text: STALE_CARD_NOTICE });
+      }
+      return;
+    }
+
+    if (env.text.startsWith('handback:')) {
+      // "Answer at the terminal instead" — release THIS held request so CC builds
+      // its dialog in the terminal. Pass-through, never an approval.
+      const requestId = env.text.slice('handback:'.length);
+      if (this.deps.permissionRouter.handBack(requestId)) {
+        await this.reply(env, { kind: 'text', text: 'Handed back — the prompt is now waiting in the terminal.' });
       } else {
         await this.reply(env, { kind: 'text', text: STALE_CARD_NOTICE });
       }
@@ -191,6 +224,12 @@ export class InboundHandler {
         : set.which === 'trust' ? { kind: 'trust' as const, enabled: set.on }
         : { kind: 'safe' as const, enabled: set.on };
       await this.runCommand(env, cmd);
+      return;
+    }
+
+    const mode = parseModeCallback(env.text);
+    if (mode) {
+      await this.runCommand(env, { kind: 'mode', mode });
       return;
     }
 
@@ -342,6 +381,37 @@ export class InboundHandler {
         this.deps.setAutoApprove(cmd.enabled);
         await this.reply(env, { kind: 'text', text: cmd.enabled ? SAFE_TOGGLE_MESSAGE.on : SAFE_TOGGLE_MESSAGE.off });
         return;
+      case 'mode': {
+        const prev = this.deps.getMode();
+        this.deps.setMode(cmd.mode);
+        const text = prev === cmd.mode
+          ? `Mode unchanged — ${MODE_DESC[cmd.mode]}`
+          : `Mode: ${prev} → ${cmd.mode}\n${MODE_DESC[cmd.mode]}`;
+        // Leaving 'all' for ANY lower rung — not just a drop to 'full' — has the
+        // same consequence: a posture only governs requests from here on, so
+        // whatever was already held under 'all' stays held, with no terminal
+        // dialog, which is the whole reason its card exists; a user tapping this
+        // button because they just got back to the keyboard would otherwise
+        // reasonably assume it hands those back too. But the notice must not
+        // claim a consequence that isn't actually true — only show it when
+        // something is actually still held.
+        const heldCount = prev === 'all' && cmd.mode !== 'all' ? this.deps.heldSubagentCount() : 0;
+        const staleHoldNotice = heldCount > 0
+          ? ` ${heldCount} already-held sub-agent request${heldCount === 1 ? '' : 's'} stay${heldCount === 1 ? 's' : ''} held — use "Answer at the terminal instead" on ${heldCount === 1 ? 'its' : 'each'} card to release ${heldCount === 1 ? 'it' : 'one'}.`
+          : '';
+        await this.reply(env, { kind: 'text', text: text + staleHoldNotice });
+        return;
+      }
+      case 'mode-prompt': {
+        const cur = this.deps.getMode();
+        await this.reply(env, {
+          kind: 'card',
+          title: 'tlive · /mode',
+          body: [`Current: **${cur}**`, '', ...MODES.map((m) => `\`${m}\` — ${MODE_DESC[m].replace(`${m} — `, '')}`)].join('\n'),
+          buttons: MODES.map((m) => ({ id: `mode:${m}`, label: m === cur ? `${m} (current)` : m })),
+        });
+        return;
+      }
       case 'toggle-prompt': {
         // Bare /mute /trust /safe (a menu tap sends the command with no arg). Reply
         // with explicit on/off buttons instead of "Unknown command" — the tap is now
@@ -369,6 +439,7 @@ export class InboundHandler {
             '`/mute on|off` — mute / unmute IM notifications (on = quiet)',
             '`/trust on|off` — pause / resume approvals (auto-allow all)',
             '`/safe on|off` — auto-allow routine ops, still ask for dangerous / unknown',
+            '`/mode off|notify|full|all` — posture: how much tlive intercepts (bare `/mode` shows the ladder)',
             '`/help` — this help',
             '',
             '**Reply to a session** — quote-reply its message and your text is injected into that terminal (needs a `tlive run` wrapper). With a single active session, just send text.',

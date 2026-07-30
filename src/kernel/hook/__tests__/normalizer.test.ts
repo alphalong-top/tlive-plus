@@ -178,6 +178,9 @@ describe('sessionStartOut(欢迎提示)', () => {
     expect(o.hookSpecificOutput.additionalContext).toContain('帮我配置 tlive');
   });
   it('claude + 已配置 + full → {}', () => expect(sessionStartOut('claude', true, 'full')).toBe('{}'));
+  it('claude + 已配置 + all → {}(all 也是"远程审批开着",不是该被提醒"关了"的状态)', () => {
+    expect(sessionStartOut('claude', true, 'all')).toBe('{}');
+  });
   it('claude + 已配置 + notify → 提示远程审批是关的(引导 tlive mode full)', () => {
     const o = JSON.parse(sessionStartOut('claude', true, 'notify'));
     expect(o.hookSpecificOutput.hookEventName).toBe('SessionStart');
@@ -206,5 +209,19 @@ describe('subagent 监看事件', () => {
     const n = parseHookInput('subagent-start', { cwd: '/x', session_id: 's' }) as any;
     expect(n.agentType).toBeUndefined();
     expect(n.delta).toBe(1);
+  });
+});
+
+describe('effectiveMode — the posture ladder', () => {
+  it('accepts all four rungs verbatim', () => {
+    expect(effectiveMode('off')).toBe('off');
+    expect(effectiveMode('notify')).toBe('notify');
+    expect(effectiveMode('full')).toBe('full');
+    expect(effectiveMode('all')).toBe('all');
+  });
+  it('unset / unknown / malformed still falls back to notify (the safe rung)', () => {
+    expect(effectiveMode(undefined)).toBe('notify');
+    expect(effectiveMode('ALL')).toBe('notify');
+    expect(effectiveMode(3)).toBe('notify');
   });
 });

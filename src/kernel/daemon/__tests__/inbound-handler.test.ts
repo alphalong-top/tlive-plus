@@ -7,6 +7,7 @@ import { createEditQueue } from '../edit-queue.js';
 import type { IncomingEnvelope, IMAdapter, OutgoingMessage } from '../../contracts/im-adapter.js';
 import type { PermissionRouter } from '../permission-router.js';
 import type { ContinueBroker } from '../../permission/continue-broker.js';
+import { STALE_CARD_NOTICE } from '../bootstrap.js';
 
 const envelope = (over: Partial<IncomingEnvelope> = {}): IncomingEnvelope => ({
   channel: 'telegram', chatId: 'c1', userId: 'u1', messageId: 'm1', text: '', ts: 0, ...over,
@@ -35,6 +36,9 @@ const baseDeps = (over: Partial<InboundHandlerDeps> = {}): InboundHandlerDeps =>
     setMuted: vi.fn(),
     setTrust: vi.fn(),
     setAutoApprove: vi.fn(),
+    getMode: () => 'full',
+    setMode: vi.fn(),
+    heldSubagentCount: () => 0,
     addAllowTool: vi.fn(),
     resolveReply: () => undefined,
     sessionInfo: () => undefined,
@@ -121,6 +125,7 @@ describe('InboundHandler', () => {
     expect(card.body).toContain('`/mute on|off`');
     expect(card.body).toContain('`/trust on|off`');
     expect(card.body).toContain('`/safe on|off`');
+    expect(card.body).toContain('/mode');
     expect(card.body).not.toContain('/desktop'); // machine-local, dropped from IM
   });
 
@@ -714,5 +719,129 @@ describe('attachment injection', () => {
     const h = new InboundHandler(baseDeps({ imBy: () => makeAdapter(msgs) }));
     await h.handle(envelope({ text: '' }));
     expect(msgs).toHaveLength(0);
+  });
+});
+
+describe('handback: callback (Answer at the terminal instead)', () => {
+  it('hands the request back and says so', async () => {
+    const handBack = vi.fn().mockReturnValue(true);
+    const msgs: Array<{ kind: string; text?: string }> = [];
+    const h = new InboundHandler(baseDeps({
+      imBy: () => makeAdapter(msgs),
+      permissionRouter: { handBack, answer: vi.fn() } as unknown as PermissionRouter,
+    }));
+    await h.handle(envelope({ text: 'handback:req-1' }));
+    expect(handBack).toHaveBeenCalledWith('req-1');
+    expect(msgs[0].text).toMatch(/terminal/i);
+  });
+
+  it('a stale handback says so instead of going silent', async () => {
+    const msgs: Array<{ kind: string; text?: string }> = [];
+    const h = new InboundHandler(baseDeps({
+      imBy: () => makeAdapter(msgs),
+      permissionRouter: { handBack: vi.fn().mockReturnValue(false), answer: vi.fn() } as unknown as PermissionRouter,
+    }));
+    await h.handle(envelope({ text: 'handback:gone' }));
+    expect(msgs[0].text).toBe(STALE_CARD_NOTICE);
+  });
+});
+
+describe('/mode from IM', () => {
+  it('a typed rung writes the posture and reports the transition', async () => {
+    // getMode deliberately differs from baseDeps' own default ('full') so a
+    // hardcoded `prev` cannot coincidentally match — the assertion below only
+    // passes if runCommand actually reads this.deps.getMode().
+    const setMode = vi.fn();
+    const msgs: Array<{ kind: string; text?: string }> = [];
+    const h = new InboundHandler(baseDeps({ imBy: () => makeAdapter(msgs), getMode: () => 'notify', setMode }));
+    await h.handle(envelope({ text: '/mode all' }));
+    expect(setMode).toHaveBeenCalledWith('all');
+    expect(msgs[0].text).toContain('notify → all');
+  });
+
+  it('the mode:<level> button goes through the same setter', async () => {
+    const setMode = vi.fn();
+    const msgs: Array<{ kind: string; text?: string }> = [];
+    const h = new InboundHandler(baseDeps({ imBy: () => makeAdapter(msgs), getMode: () => 'notify', setMode }));
+    await h.handle(envelope({ text: 'mode:full' }));
+    expect(setMode).toHaveBeenCalledWith('full');
+  });
+
+  it('all → full via the sub-agent card button warns that already-held sub-agent requests stay held (when some ARE held)', async () => {
+    // The button lives on a HELD sub-agent card (bootstrap.ts: `mode:full`,
+    // 'Stop holding sub-agents'). It only changes the posture for requests from
+    // here on — the one in hand stays held with no terminal dialog, which is
+    // why the card exists at all. Silence here reads as "and give me this one
+    // back too", which is false.
+    const setMode = vi.fn();
+    const msgs: Array<{ kind: string; text?: string }> = [];
+    const h = new InboundHandler(baseDeps({ imBy: () => makeAdapter(msgs), getMode: () => 'all', setMode, heldSubagentCount: () => 2 }));
+    await h.handle(envelope({ text: 'mode:full' }));
+    expect(msgs[0].text).toContain('stay held');
+    expect(msgs[0].text).toContain('Answer at the terminal instead');
+  });
+
+  it('all → notify ALSO warns when a sub-agent request is still held — leaving `all` for ANY lower rung strands it, not just a drop to `full`', async () => {
+    const msgs: Array<{ kind: string; text?: string }> = [];
+    const h = new InboundHandler(baseDeps({ imBy: () => makeAdapter(msgs), getMode: () => 'all', heldSubagentCount: () => 1 }));
+    await h.handle(envelope({ text: 'mode:notify' }));
+    expect(msgs[0].text).toContain('Answer at the terminal instead');
+  });
+
+  it('all → off ALSO warns when a sub-agent request is still held — any departure from `all` strands held requests', async () => {
+    const msgs: Array<{ kind: string; text?: string }> = [];
+    const h = new InboundHandler(baseDeps({ imBy: () => makeAdapter(msgs), getMode: () => 'all', heldSubagentCount: () => 3 }));
+    await h.handle(envelope({ text: 'mode:off' }));
+    expect(msgs[0].text).toContain('Answer at the terminal instead');
+  });
+
+  it('leaving `all` with NO sub-agent request actually held carries no stale-hold notice — a card must not claim a consequence that is not true', async () => {
+    const msgs: Array<{ kind: string; text?: string }> = [];
+    const h = new InboundHandler(baseDeps({ imBy: () => makeAdapter(msgs), getMode: () => 'all', heldSubagentCount: () => 0 }));
+    await h.handle(envelope({ text: 'mode:notify' }));
+    expect(msgs[0].text).not.toContain('Answer at the terminal instead');
+    expect(msgs[0].text).not.toContain('already-held');
+  });
+
+  it('full → all (an upgrade, not a departure from `all`) carries no stale-hold notice even if sub-agent requests happen to be held', async () => {
+    const msgs: Array<{ kind: string; text?: string }> = [];
+    const h = new InboundHandler(baseDeps({ imBy: () => makeAdapter(msgs), getMode: () => 'full', heldSubagentCount: () => 3 }));
+    await h.handle(envelope({ text: 'mode:all' }));
+    expect(msgs[0].text).not.toContain('Answer at the terminal instead');
+    expect(msgs[0].text).not.toContain('already-held');
+  });
+
+  it('a same-rung tap and every OTHER transition carry no stale-hold notice', async () => {
+    const msgs: Array<{ kind: string; text?: string }> = [];
+    const h = new InboundHandler(baseDeps({ imBy: () => makeAdapter(msgs), getMode: () => 'notify' }));
+    await h.handle(envelope({ text: 'mode:full' })); // notify → full, not all → full
+    expect(msgs[0].text).not.toContain('stay held');
+  });
+
+  it('an unknown level in a callback is ignored, not applied', async () => {
+    const setMode = vi.fn();
+    const h = new InboundHandler(baseDeps({ imBy: () => makeAdapter([]), setMode }));
+    await h.handle(envelope({ text: 'mode:root' }));
+    expect(setMode).not.toHaveBeenCalled();
+  });
+
+  it('bare /mode replies with the four rungs and marks the current one', async () => {
+    const msgs: Array<{ kind: string; body?: string; buttons?: Array<{ id: string; label: string }> }> = [];
+    const h = new InboundHandler(baseDeps({ imBy: () => makeAdapter(msgs as Array<{ kind: string; text?: string }>), getMode: () => 'full' }));
+    await h.handle(envelope({ text: '/mode' }));
+    expect(msgs[0].kind).toBe('card');
+    expect(msgs[0].buttons?.map((b) => b.id)).toEqual(['mode:off', 'mode:notify', 'mode:full', 'mode:all']);
+    expect(msgs[0].buttons?.find((b) => b.id === 'mode:full')?.label).toMatch(/current/i);
+  });
+
+  it('the "current" marker tracks the injected getMode, not a fixed rung — a different current moves the marker to a different button', async () => {
+    // getMode returns 'notify' here, NOT 'full' (baseDeps' own default), so this
+    // only passes if the mode-prompt branch actually calls this.deps.getMode()
+    // rather than being hardcoded to whatever the default fixture happens to be.
+    const msgs: Array<{ kind: string; body?: string; buttons?: Array<{ id: string; label: string }> }> = [];
+    const h = new InboundHandler(baseDeps({ imBy: () => makeAdapter(msgs as Array<{ kind: string; text?: string }>), getMode: () => 'notify' }));
+    await h.handle(envelope({ text: '/mode' }));
+    expect(msgs[0].buttons?.find((b) => b.id === 'mode:notify')?.label).toMatch(/current/i);
+    expect(msgs[0].buttons?.find((b) => b.id === 'mode:full')?.label).not.toMatch(/current/i);
   });
 });

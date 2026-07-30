@@ -28,7 +28,8 @@ import { ensureCodexAppServer, codexAppServerSockPath } from '../codex/spawn.js'
 import { connectCodexRpc } from '../codex/rpc.js';
 import { startCompanion, type Companion } from '../codex/companion.js';
 import { excerptForCard } from './excerpt.js';
-import { TURN_FINISHED_SENTINEL, effectiveMode } from '../hook/normalizer.js';
+import { TURN_FINISHED_SENTINEL, effectiveMode, type ShimMode } from '../hook/normalizer.js';
+import { writeMode } from '../config/mode.js';
 
 export interface DaemonHandle {
   shutdown(): Promise<void>;
@@ -233,9 +234,23 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
   // notifier itself is created enabled so a config-off start can still be
   // switched on without a restart.
   let desktopOn = cfg.approvals?.desktopNotify ?? true;
-  /** Posture, same resolution the shim uses. Only `notify` still needs the bare
-   *  "answer in the terminal" IM text (see the permissionPrompt handler). */
-  const mode = effectiveMode(cfg.mode);
+  /** 姿态是 config-backed 的(shim 每个 hook 事件都重读),所以 daemon 绝不能
+   *  缓存它:`tlive mode all` 或 IM 的 /mode 必须改变**下一次**审批的行为,不需要
+   *  重启。此前 cfg 只在 bootstrap 读一次,子代理分支于是永远停在启动时的姿态。
+   *
+   *  文件缺失 ≠ 读不出来,两者故意分两条路:文件不存在时 loadConfig 走正常的
+   *  DEFAULT 分支(不抛),cfg.mode 是 undefined,effectiveMode 落到 'notify' ——
+   *  这和 shim 的 readMode() 对同一份(缺席的)config.json 算出来的结果完全一样
+   *  (single source of truth,两边不会因为文件在不在而分裂)。而且这条路根本
+   *  摸不到:modeShortCircuit 一旦解出 'notify' 就在 IPC 之前把 permission-request
+   *  短路成 `{}`,daemon 这一层永远收不到那次请求,所以这里返回什么都不影响真实
+   *  的 hook 链路,只有绕开 shim 直接打 IPC 的调用方(如测试)才会观察到它。
+   *  catch 分支管的是另一种情形——文件在但 JSON.parse 抛了(写到一半/写坏)——
+   *  这才回落到启动时的 cfg.mode,当一次性的抗抖动,不是"删了配置就该记住上次
+   *  姿态"。 */
+  const currentMode = (): ShimMode => {
+    try { return effectiveMode(loadConfig(opts.home).mode); } catch { return effectiveMode(cfg.mode); }
+  };
   const desktop = opts.desktopNotifier ?? createDesktopNotifier({
     action: {
       label: 'Open dashboard',
@@ -261,7 +276,7 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
   const clearLocalPrompt = (key: string, sessionId: string | undefined, cwd: string): void => {
     if (!localPrompts.clear({ key, ...(sessionId ? { sessionId } : {}) })) return;
     if (sessions.get(key)?.pending?.local) sessions.upsert({ key, cwd, pending: null });
-    if (permissionRouter.pendingCount() === 0 && localPrompts.count() === 0) void desktop.clear();
+    if (nothingWaiting()) void desktop.clear();
   };
 
   // Same lifetime as the ask flow's *pending* window, but never consumed by an
@@ -352,7 +367,7 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
 
   const sendToChat = async (
     target: PermChat,
-    msg: { title?: string; body?: string; text?: string; requestId?: string; toolName?: string; cwd?: string; ask?: AskContext },
+    msg: { title?: string; body?: string; text?: string; requestId?: string; toolName?: string; cwd?: string; ask?: AskContext; agentId?: string; buttons?: Array<{ id: string; label: string }>; onSent?: (s: { channel: string; messageId: string }) => void },
   ): Promise<void> => {
     const adapter = (opts.imAdapters ?? []).find((a) => a.channel === target.channel);
     if (!adapter) return;
@@ -362,7 +377,13 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
       const text = `${tag}${msg.text}`;
       sent = await adapter.send({ kind: 'text', text });
     } else {
-      const title = msg.title ? `${tag}${msg.title}` : undefined;
+      // A HELD sub-agent card (agentId present) has no parallel terminal dialog
+      // while it's held — unlike a main-session card, answering remotely is the
+      // only way (short of handing it back). Mark it as such, matching the
+      // pass-through notice's own `${toolName} · sub-agent` idiom, so the two
+      // never read as indistinguishable. Tag prefix behaviour is unchanged:
+      // tag still comes first, this only appends after the title.
+      const title = msg.title ? `${tag}${msg.title}${msg.agentId ? ' · sub-agent' : ''}` : undefined;
       const body = msg.body ?? '';
       sent = await adapter.send({
         kind: 'card',
@@ -372,7 +393,12 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
         // multiSelect question gets checkboxes + Submit(N). A freshly sent
         // card is always at the batch's first question with nothing ticked —
         // every later repaint goes through inbound-handler's editAskCards.
-        ...(msg.requestId ? { buttons: msg.ask
+        // Explicit buttons win (the pass-through notice has no requestId yet must
+        // still carry its one-tap posture switch). Otherwise: the standard set,
+        // plus — for a HELD sub-agent, whose terminal dialog does not exist while
+        // we hold it — a way to get that dialog back and a way to stop holding
+        // sub-agents at all.
+        ...(msg.buttons ? { buttons: msg.buttons } : msg.requestId ? { buttons: msg.ask
           ? askButtons(msg.requestId, msg.ask.batch, 0, [])
           : [
               { id: `approve:${msg.requestId}`, label: 'Allow' },
@@ -383,6 +409,10 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
               // pending request (permissionRouter.toolNameFor).
               ...(msg.toolName ? [{ id: `allowtool:${msg.requestId}`, label: `Always allow ${msg.toolName}` }] : []),
               { id: `pause:${msg.requestId}`, label: 'Pause approvals' },
+              ...(msg.agentId ? [
+                { id: `handback:${msg.requestId}`, label: 'Answer at the terminal instead' },
+                { id: 'mode:full', label: 'Stop holding sub-agents' },
+              ] : []),
             ],
         } : {}),
         ...(msg.ask && msg.requestId ? (() => {
@@ -407,6 +437,74 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
       }
     }
     if (msg.cwd) rememberMsg(target.channel, sent.messageId, msg.cwd);
+    // Reported rather than returned: the return type is part of the router's dep
+    // contract (Promise<void>), and only this one caller needs the id back.
+    msg.onSent?.({ channel: target.channel, messageId: sent.messageId });
+  };
+
+  /** Sub-agent pass-through notices, so each can retire itself when that
+   *  sub-agent's tool actually runs. Keyed by (key, agentId, toolName) — the one
+   *  pair carried by BOTH the pass-through and the later PostToolUse, verified on
+   *  a live session. Kept separate from `sentCards` on purpose: these carry no
+   *  requestId, answer nothing, and must stay out of the reply-routing and
+   *  stale-card machinery that indexes real approvals. */
+  const passthruNotices = new Map<string, Array<{ channel: string; messageId: string; body: string }>>();
+  const passthruKey = (key: string, agentId: string, toolName: string): string => `${key}\u0000${agentId}\u0000${toolName}`;
+
+  /** requestId for the dashboard's read-only pending card on a pass-through. */
+  const passthruRequestId = (agentId: string, toolName: string): string => `passthru:${agentId}:${toolName}`;
+
+  /** Sub-agent dialogs handed back to the terminal and not yet observed running.
+   *  Separate from passthruNotices (which only has entries when an IM card was
+   *  actually sent) because the desktop toast must work with no IM at all — this
+   *  is what lets retirePassthruNotice close the toast even when there was never
+   *  a card to edit. */
+  const passthruWaiting = new Set<string>(); // passthruKey(key, agentId, toolName)
+
+  /** The single "is anything at all waiting for the user" predicate behind the
+   *  desktop toast's lifetime. THREE surfaces feed it today (a held approval /
+   *  a tracked CC-native local prompt / an outstanding sub-agent pass-through)
+   *  and every one of them MUST be represented here — this used to be three
+   *  separate copies of the same condition, and the copy at two of the three
+   *  call sites silently forgot passthruWaiting, so a main-session approval
+   *  resolving (or a local prompt clearing) anywhere closed a still-waiting
+   *  sub-agent's toast. The next surface that gets its own waiting-tracker
+   *  must be added HERE, not at whichever call site happens to need it. */
+  const nothingWaiting = (): boolean =>
+    permissionRouter.pendingCount() === 0 && localPrompts.count() === 0 && passthruWaiting.size === 0;
+
+  /** The sub-agent's tool ran, so its dialog was answered at the keyboard. Mark
+   *  the notice so it stops reading as "still waiting", clear its read-only
+   *  dashboard card, and close the desktop toast once nothing else is waiting. */
+  const retirePassthruNotice = (key: string, cwd: string, agentId: string, toolName: string): void => {
+    const id = passthruKey(key, agentId, toolName);
+    passthruWaiting.delete(id);
+    // Same guard as onResolved: only clear the registry's ONE pending slot if
+    // THIS notice still owns it — a main-session held approval (or a
+    // different pass-through that raced in) must survive untouched. Silent —
+    // no self-broadcast: this event's own hook.event handler broadcasts the
+    // merged view right after (mirrors clearLocalPrompt's doc comment above).
+    if (sessions.get(key)?.pending?.requestId === passthruRequestId(agentId, toolName)) {
+      sessions.upsert({ key, cwd, pending: null });
+    }
+    if (nothingWaiting()) void desktop.clear();
+    const notices = passthruNotices.get(id);
+    if (!notices) return;
+    passthruNotices.delete(id);
+    for (const n of notices) {
+      const adapter = (opts.imAdapters ?? []).find((a) => a.channel === n.channel);
+      if (!adapter) continue;
+      void adapter.edit(n.messageId, {
+        kind: 'card',
+        title: `${toolName} · sub-agent · ran at the terminal`,
+        // n.body is the BASE body only (onPassthrough stores it without the
+        // "waiting" suffix) — the title now says the tool ran, so the body
+        // must not still claim it's waiting (cards must not lie). The tool
+        // name/input in the base body is kept, not dropped, so you can still
+        // see what ran.
+        body: n.body,
+      }).catch(() => undefined);
+    }
   };
 
   // Reap wrapped sessions whose `tlive run` process died without unregistering (kill -9 / crash).
@@ -415,7 +513,7 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
   }, 30_000);
   sweeper.unref();
 
-  const OUTCOME: Record<string, string> = { allow: 'Allowed', deny: 'Denied', defer: 'Timed out', local: 'Answered in terminal', gone: 'Session ended' };
+  const OUTCOME: Record<string, string> = { allow: 'Allowed', deny: 'Denied', defer: 'Timed out', local: 'Answered in terminal', gone: 'Session ended', handback: 'Handed back to the terminal' };
 
   const permissionRouter = new PermissionRouter({
     configuredChats,
@@ -445,14 +543,88 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
       return renderApprovalCard({ toolName: req.toolName, input: req.input });
     },
     graceSec: () => Math.max(cfg.approvals?.approvalGraceSec ?? 10, 0),
-    // Sub-agents pass through by default (tlive transparent — no tlive-introduced
-    // block); opt in to hold + remote-answer sub-agent approvals. See permission-router.
-    holdSubagents: () => cfg.approvals?.holdSubagents ?? false,
+    // Sub-agents pass through on 'full' (tlive transparent — no tlive-introduced
+    // block); the 'all' rung opts into holding + remotely answering them, at the
+    // cost of their terminal dialog. See permission-router's holdSubagents doc.
+    holdSubagents: () => currentMode() === 'all',
     // Opt-in: on a held approval's timeout, deny (→ turn ends → continue card can
     // redirect) instead of the default defer (→ CC-native local fallback).
     timeoutAction: () => cfg.approvals?.timeoutAction ?? 'defer',
     log: logJson,
+    // A sub-agent's approval was handed back to CC (its terminal dialog is what
+    // answers it). Say what is blocked while we still know — CC's own
+    // permission_prompt notification carries no tool name and no agentId, so it
+    // could never say this, which is why full mode drops it. Deliberately NO
+    // requestId: sendToChat only attaches Allow/Deny when one is present, and an
+    // affordance that cannot work is worse than none (see onPassthrough).
+    onPassthrough: ({ key, cwd, agentId, toolName, title, body }) => {
+      logJson('permission.passthrough.notice', { key, agentId, toolName });
+      void title; // the IM/dashboard titles below are the sub-agent-specific "<tool> · sub-agent", not the generic card title
+      passthruWaiting.add(passthruKey(key, agentId, toolName));
+      // A sub-agent pass-through can be the FIRST thing the daemon ever hears
+      // about this session (e.g. right after a daemon restart) — register it
+      // before the desktop ping below renders a `sessionTag(key)` label, same
+      // fix as hook.notify's. The guard skips a no-op write for an already-known
+      // session (upsert's patch merge would preserve its state either way).
+      if (!sessions.get(key)) sessions.upsert({ key, cwd });
+      // Desktop toast: the "at this machine, not watching the terminal" signal.
+      // Gated ONLY by desktopOn — never by IM mute (IM ⊥ desktop), so it fires
+      // with no IM configured at all, exactly like onPending's ping below.
+      if (desktopOn) void desktop.ping(`${sessionTag(key)}${toolName} · sub-agent`, 'Waiting at the terminal — answer it there.');
+      // Dashboard: read-only pending (local: true) — there is no held request
+      // behind this, so Allow/Deny would be a button that cannot work (same
+      // rule as the notify-mode local-prompt card). ONE pending slot per
+      // session key: never evict an already-held main-session approval.
+      if (!sessions.get(key)?.pending) {
+        events.broadcast({ type: 'session-upsert', session: sessions.upsert({ key, cwd, status: 'waiting-approval', pending: {
+          requestId: passthruRequestId(agentId, toolName), title: `${toolName} · sub-agent`, body, local: true,
+        } }) });
+      }
+      // IM card stays mute-gated (/mute is IM-only) — the desktop toast and
+      // dashboard card above must fire regardless of it.
+      if (!(muted || sessions.get(key)?.muted)) {
+        // The waiting sentence is appended only to THIS live notice — the
+        // suffix is not stored below. retirePassthruNotice's edit reuses the
+        // stored base `body`, so once the title says the tool ran, the body
+        // does not keep contradicting it by still saying "waiting" (cards
+        // must not lie). The base body itself (tool + input) is kept, not
+        // dropped, so the retired card still shows what ran.
+        //
+        // *…*, not _..._: telegram-html.ts deliberately does not support
+        // underscore emphasis (ordinary snake_case/file_path content would
+        // turn italic), so the raw underscores used to leak into the message
+        // verbatim (real Telegram screenshot). `*single*` is what the
+        // renderer actually converts to <i>.
+        const notice = `${body}\n\n*Waiting at the terminal — a sub-agent's prompt can only be answered there.*`;
+        for (const t of configuredChats()) {
+          void sendToChat(t, {
+            title: `${toolName} · sub-agent`, body: notice, cwd: key,
+            // The one gap this notice cannot close: THIS dialog can only be answered
+            // at the keyboard. What it can do is stop the next one from being lost —
+            // one tap moves the posture up so the rest of this run comes to you.
+            buttons: [{ id: 'mode:all', label: 'Hold sub-agents from now on' }],
+            onSent: (s) => {
+              const id = passthruKey(key, agentId, toolName);
+              const list = passthruNotices.get(id) ?? [];
+              list.push({ channel: s.channel, messageId: s.messageId, body }); // base body — no "waiting" suffix
+              passthruNotices.set(id, list);
+            },
+          })
+            .catch((e: unknown) => {
+              logJson('permission.passthrough.undelivered', { key, agentId, toolName, channel: t.channel, error: e instanceof Error ? e.message : String(e) });
+            });
+        }
+      }
+    },
     onPending: ({ key, cwd, requestId, title, body, toolName, ask }) => {
+      // A permission request can be the FIRST thing the daemon ever hears
+      // about this session (e.g. right after a daemon restart) — register it
+      // before the desktop ping below renders a `sessionTag(key)` label, same
+      // fix as hook.notify's and onPassthrough's. The guard skips a no-op write
+      // for an already-known session (upsert's patch merge preserves its state
+      // either way); the final upsert below still carries the full
+      // status/pending patch.
+      if (!sessions.get(key)) sessions.upsert({ key, cwd });
       // Desktop ping FIRST — this notification is for the person AT this
       // machine, so it must be immediate (the IM card's grace delay exists to
       // spare the phone when you answer at the keyboard — delaying the local
@@ -498,7 +670,7 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
       // can't pin the toast; a genuine separate local prompt for another
       // session key is untouched.
       localPrompts.clear({ key });
-      if (permissionRouter.pendingCount() === 0 && localPrompts.count() === 0) void desktop.clear();
+      if (nothingWaiting()) void desktop.clear();
       askFlow.end(requestId); askOwner.delete(requestId); // no leak — covers defer/timeout/local-answer paths that skip asksubmit:/askskip: entirely
       const isAsk = askRequestIds.delete(requestId); // true only for an AskUserQuestion card (Minor 4)
       // Only touch the session view if THIS request still owns the pending slot —
@@ -764,11 +936,12 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
           // nothing to reply to, and inventing a decision would itself be an
           // auto-allow path. No wire output at all.
           if (r.decision === 'gone') return;
-          // 'local' (answered in the terminal) maps to 'defer' on the wire: the shim
-          // outputs pass-through {} — a no-op for a dialog that is already gone.
+          // 'local' (answered in the terminal) and 'handback' (you asked for the
+          // dialog back) both map to 'defer' on the wire: the shim outputs
+          // pass-through {} — CC then owns the prompt, which is the point.
           reply({
             kind: 'hook.permission.result',
-            decision: r.decision === 'local' ? 'defer' : r.decision,
+            decision: r.decision === 'local' || r.decision === 'handback' ? 'defer' : r.decision,
             ...(r.message ? { message: r.message } : {}),
             ...(r.updatedInput !== undefined ? { updatedInput: r.updatedInput } : {}),
           });
@@ -818,6 +991,17 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
         }
         case 'hook.notify': {
           const key = resolveKey(req.sessionId, req.cwd, req.wrappedId);
+          // A notify can be the FIRST thing the daemon ever hears about this
+          // session (e.g. right after a daemon restart, for a session that was
+          // already running) — register it before anything below renders a
+          // `sessionTag(key)` label, or the very first line ever sent for this
+          // session goes out with no label at all (the one thing that line
+          // cannot answer on its own). The guard is an optimization, not a
+          // safety belt: only a genuine miss gets this bare upsert, but an
+          // existing entry would survive one anyway — `muted` is not an
+          // UpsertPatch field at all, and continueId/pending/status fall back
+          // to the previous value when the patch omits them.
+          if (!sessions.get(key)) sessions.upsert({ key, cwd: req.cwd });
           const s = sessions.get(key);
           if (req.permissionPrompt) {
             // A CC-native permission dialog is up (issue #49). A held request
@@ -835,16 +1019,31 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
             // sub-agent. So "is a held card already covering this dialog?" is
             // unanswerable in principle. It is used only to avoid clobbering an
             // answerable card with the read-only one below — a wrong guess costs
-            // a missed toast, never a decision. The IM push is NOT gated on it
-            // (see pushIm): posture is an exact signal where this one isn't.
+            // a missed toast, never a decision.
             const heldOwnsIt = permissionRouter.hasPendingFor({ key, sessionId: req.sessionId });
+            // Posture, unlike heldOwnsIt, is exact — and read LIVE (never a
+            // boot-time value): the posture is remotely settable (`tlive mode`,
+            // IM's `/mode`), so this must track the CURRENT rung, not whatever
+            // was in config.json when the daemon started. In every holding rung
+            // (`full`, `all`) every request tlive saw was either held or handed
+            // back, and the one handed-back case that produces a dialog — a
+            // sub-agent pass-through — already pushed a notice carrying the tool
+            // and input this event lacks (see onPassthrough). So the whole chain
+            // below is redundant there, and building it anyway is what produced a
+            // card nothing could retire: retiring needs the answer, and the only
+            // signal is the sub-agent's PostToolUse, which this path must ignore
+            // because a sibling's activity must not clear the main session's
+            // reminder. `notify` is the only non-holding rung reachable here
+            // (`off` short-circuits in the shim before any IPC) — there this
+            // chain is the ONLY signal a dialog is waiting, so it must run.
+            const redundant = currentMode() !== 'notify';
             // The two arms look identical from outside — one means "tlive is
             // gating this and the card owns every surface", the other means
             // "tlive is NOT gating this, the terminal is the only answer path".
             // Confusing them is exactly how a pass-through got mistaken for a
             // held approval, so the log says which.
-            logJson('permission.localPrompt', { key, ...(req.sessionId ? { sessionId: req.sessionId } : {}), heldOwnsIt, action: heldOwnsIt ? 'suppressed' : 'tracked' });
-            if (!heldOwnsIt) {
+            logJson('permission.localPrompt', { key, ...(req.sessionId ? { sessionId: req.sessionId } : {}), heldOwnsIt, action: heldOwnsIt ? 'suppressed' : redundant ? 'holding-mode-passthrough' : 'tracked' });
+            if (!heldOwnsIt && !redundant) {
               localPrompts.note(key, req.sessionId);
               // Desktop first, immediately — the waiting slot (ping/clear
               // lifecycle), not an info banner: the dialog IS a waiting state.
@@ -854,26 +1053,14 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
               events.broadcast({ type: 'session-upsert', session: sessions.upsert({ key, cwd: req.cwd, status: 'waiting-approval', pending: { requestId: `local:${key}`, title: 'Permission needed', body: req.message, local: true } }) });
               // IM text rides the approval-card grace: answered at the
               // keyboard within the window → never sent (zero spam at the
-              // keyboard, same contract as the held-card push).
-              //
-              // …and in `full` mode it is not sent at all. Reaching here in full
-              // mode means tlive SAW this request and chose to hand it back
-              // (sub-agent pass-through, policy allow, no answer surface).
-              // "Handed back" is defined as "behave as if tlive were not
-              // installed", and a bare un-answerable "go look at your terminal"
-              // text is a message the no-hook baseline never sends. It also
-              // cannot be attributed: CC's Notification input carries neither
-              // agent_id nor tool_name, so we cannot even say which dialog it
-              // belongs to. In `notify` mode the opposite holds — tlive never
-              // gates, so this text is the ONLY signal a dialog is waiting.
-              // Desktop + dashboard above are tlive's own surfaces (not CC
-              // output) and stay in both postures.
+              // keyboard, same contract as the held-card push). Only `notify`
+              // mode reaches here, and there this text is the ONLY signal that a
+              // dialog is waiting — see the posture note above.
               const pushIm = (): void => {
                 // Each bail-out is logged with its own tag: "no IM text arrived"
                 // has four different causes and they are not interchangeable.
                 const note = (outcome: string, extra?: Record<string, unknown>): void =>
                   logJson('permission.localPrompt.im', { key, ...(req.sessionId ? { sessionId: req.sessionId } : {}), outcome, ...extra });
-                if (mode === 'full') return note('full-mode-passthrough');
                 if (!localPrompts.has(key, req.sessionId)) return note('answered-in-grace');
                 if (permissionRouter.hasPendingFor({ key, sessionId: req.sessionId })) return note('raced-held-card');
                 if (muted || sessions.get(key)?.muted) return note('muted');
@@ -932,6 +1119,10 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
           if (ev.event === 'activity') {
             // 精确关联:回答者身份(agent_id 缺失 = 主会话)必须与 pending 一致
             permissionRouter.cancel({ key, toolName: ev.toolName, sessionId: ev.sessionId, matchAgent: ev.agentId ?? null });
+            // This sub-agent's tool ran ⇒ its dialog was answered at the keyboard.
+            // agentId is required, not optional: parallel sub-agents share key +
+            // toolName, so matching without it would retire a sibling's notice.
+            if (ev.agentId) retirePassthruNotice(key, ev.cwd, ev.agentId, ev.toolName);
             // Main-session tool ran → the CC-native dialog (if we tracked one)
             // was answered. Sub-agent activity doesn't touch it: a backgrounded
             // agent runs in parallel with a still-waiting main dialog. No
@@ -999,6 +1190,9 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
     takeLatestContinueId: () => { const id = latestContinueId; latestContinueId = null; return id; },
     setMuted: (m: boolean) => runtimeSet('mute', m),
     setTrust: (t: boolean) => runtimeSet('trust', t),
+    getMode: () => currentMode(),
+    setMode: (m) => { writeMode(opts.home, m); logJson('mode.set', { mode: m }); },
+    heldSubagentCount: () => permissionRouter.heldSubagentCount(),
     setAutoApprove: (safe: boolean) => runtimeSet('safe', safe),
     addAllowTool: (tool: string) => { policyState.allowTools?.add(tool); },
     askFlow,

@@ -7,6 +7,8 @@ import { request, daemonSocketPath } from '../../ipc/client';
 import type { IMAdapter, IMChannel, OutgoingMessage, IncomingEnvelope } from '../../contracts/im-adapter';
 import { SessionRegistry } from '../../web/session-registry';
 import { until } from '../../__tests__/wait.js';
+import { writeMode } from '../../config/mode.js';
+import { mdToTelegramHtml } from '../../../adapters/im/telegram-html.js';
 
 // #45 — robustness helpers for this file's "held request" pattern
 // (const pending = request(...); …asserts…; await pending). On a slow/jittery
@@ -488,6 +490,41 @@ describe('AskUserQuestion remote card (Task 9)', () => {
     expect(sent).toHaveLength(0);  // …IM stays silent
   });
 
+  it('a notify for a session the daemon has never seen still carries the "<label> · " tag — first contact must not render before the session is registered', async () => {
+    writeFileSync(join(tmp, 'config.json'), JSON.stringify({
+      web: { enabled: false },
+      adapters: { telegram: { token: 't', chatIdAllowList: ['c1'] } },
+    }));
+    const sent: OutgoingMessage[] = [];
+    const adapter = interactiveAdapter('telegram', sent);
+    h = await bootstrapDaemon({ home: tmp, imAdapters: [adapter] });
+    const sock = daemonSocketPath(tmp);
+    // Mirrors a daemon restart: the registry is empty, and this notify is the
+    // FIRST thing the daemon ever hears about this session (started earlier).
+    expect(h.sessions.get('s-unseen')).toBeUndefined();
+    await request(
+      { kind: 'hook.notify', cwd: '/unseen-project', sessionId: 's-unseen', level: 'info', message: 'Claude is waiting for your input' },
+      { socketPath: sock, timeoutMs: 2000 },
+    );
+    await waitForSent(sent);
+    const msg = sent[0] as { kind: 'text'; text: string };
+    expect(msg.text.startsWith('unseen-project · ')).toBe(true);
+  });
+
+  it('a pre-existing registry entry (muted, with a pending approval) survives a notify unclobbered', async () => {
+    writeFileSync(join(tmp, 'config.json'), JSON.stringify({ web: { enabled: false } }));
+    h = await bootstrapDaemon({ home: tmp });
+    const key = 's-existing';
+    h.sessions.upsert({ key, cwd: '/existing-project', pending: { requestId: 'r1', title: 'Old pending', body: 'body' } });
+    h.sessions.setMuted(key, true);
+    await request(
+      { kind: 'hook.notify', cwd: '/existing-project', sessionId: key, level: 'info', message: 'Claude is waiting for your input' },
+      { socketPath: daemonSocketPath(tmp), timeoutMs: 2000 },
+    );
+    expect(h.sessions.get(key)?.muted).toBe(true);
+    expect(h.sessions.get(key)?.pending?.requestId).toBe('r1');
+  });
+
   it('the settled card keeps its body — you can still see WHAT was approved (live feedback)', async () => {
     writeFileSync(join(tmp, 'config.json'), JSON.stringify({
       web: { enabled: false },
@@ -902,6 +939,33 @@ describe('quoting a live approval card = deny with guidance (Task 7)', () => {
     expect(editedTitle).toContain('Denied');
     expect(editedTitle).not.toContain('Denied with guidance');
   });
+
+  // Mirrors the hook.notify first-contact fix above, one call site over:
+  // onPending's desktop ping also renders sessionTag(key) — and used to do so
+  // BEFORE its own final `sessions.upsert(...)` registered the session, so a
+  // session's very first tool-permission request (e.g. right after a daemon
+  // restart) produced an unlabelled toast.
+  it('the first-ever permission request for a never-before-seen session still carries the "<label> · " toast prefix (onPending)', async () => {
+    writeFileSync(join(tmp, 'config.json'), JSON.stringify({
+      web: { enabled: false },
+      approvals: { approvalGraceSec: 0 },
+      adapters: { telegram: { token: 't', chatIdAllowList: ['c1'] } },
+    }));
+    const sent: OutgoingMessage[] = [];
+    const adapter = interactiveAdapter('telegram', sent);
+    const notes: Array<{ title: string; body: string }> = [];
+    h = await bootstrapDaemon({ home: tmp, imAdapters: [adapter], desktopNotifier: { ping: async (title, body) => { notes.push({ title, body }); }, clear: async () => {}, info: async () => {} } });
+    const sock = daemonSocketPath(tmp);
+    // Mirrors a daemon restart: the registry is empty before this request.
+    expect(h.sessions.get('s-fresh')).toBeUndefined();
+    const pending = request(
+      { kind: 'hook.permission.request', cwd: '/fresh-project', sessionId: 's-fresh', toolName: 'Bash', input: { command: 'ls' }, timeoutSec: 60 },
+      { socketPath: sock, timeoutMs: 10_000 },
+    );
+    held(pending);
+    await until(() => { expect(notes).toHaveLength(1); });
+    expect(notes[0].title.startsWith('fresh-project · ')).toBe(true);
+  });
 });
 
 // Regression: the Codex resume path (makeCodexResumeHandler → ContinueBroker →
@@ -953,6 +1017,472 @@ describe('Codex resume handler → continue card (regression: sentinel mismatch)
     // what matters here is that the body is NOT a quoted repeat of the title.
     expect(card.title?.endsWith('Turn finished')).toBe(true);
     expect(card.body).toBe('\n*Reply to this message to continue.*');
+  });
+});
+
+// A sub-agent's request is handed straight back to CC so its terminal dialog
+// appears undelayed — but tlive holds the full request in its hands at that
+// moment (tool name, whole input, agentId) and used to throw all of it away. The
+// only thing the user then got was CC's own permission_prompt notification, which
+// carries no tool name and no agentId, so it could say nothing useful and could
+// not be attributed; full mode suppresses it for that reason. Result: a blocked
+// sub-agent was invisible. Push what we already know instead.
+//
+// No Allow/Deny buttons: that dialog can only be answered at the keyboard (CC
+// awaits the hook before building it, so the hook invocation is over by the time
+// the dialog exists). Buttons that cannot work are worse than none.
+describe('sub-agent pass-through tells you what is blocked', () => {
+  const CFG = {
+    mode: 'full',
+    web: { enabled: false },
+    approvals: { approvalGraceSec: 0 },
+    adapters: { telegram: { token: 't', chatIdAllowList: ['c1'] } },
+  };
+
+  it('pushes the tool and its input, without answer buttons', async () => {
+    writeFileSync(join(tmp, 'config.json'), JSON.stringify(CFG));
+    const sent: OutgoingMessage[] = [];
+    const adapter = interactiveAdapter('telegram', sent);
+    h = await bootstrapDaemon({ home: tmp, imAdapters: [adapter] });
+    const sock = daemonSocketPath(tmp);
+
+    const r = await request(
+      {
+        kind: 'hook.permission.request', cwd: '/w', sessionId: 's1', agentId: 'a-77',
+        toolName: 'Bash', input: { command: 'rm -rf /tmp/scratch' }, timeoutSec: 60,
+      },
+      { socketPath: sock, timeoutMs: 5000 },
+    );
+    // Handed back untouched — the terminal dialog must not be delayed.
+    expect(r).toEqual({ kind: 'hook.permission.result', decision: 'defer' });
+
+    await waitForSent(sent);
+    const msg = sent[0] as { kind: string; title?: string; body?: string; text?: string; buttons?: Array<{ id: string }> };
+    const shown = `${msg.title ?? ''}\n${msg.body ?? ''}\n${msg.text ?? ''}`;
+    expect(shown).toContain('Bash');                    // what tool
+    expect(shown).toContain('rm -rf /tmp/scratch');      // and what it wants to do
+    // Nothing that pretends to be answerable from here.
+    const ids = (msg.buttons ?? []).map((b) => b.id);
+    expect(ids.filter((id) => id.startsWith('approve:') || id.startsWith('deny:'))).toEqual([]);
+  });
+
+  // The notice has to retire itself, or it becomes a card that still says
+  // "waiting" long after the thing was answered. (agentId, toolName) is what
+  // makes that possible: measured on a live session, the sub-agent's PostToolUse
+  // comes back carrying the SAME pair the pass-through carried, so the two ends
+  // can be matched. Note the notification path could never do this — CC's
+  // permission_prompt has no agentId at all.
+  it('retires the notice once that sub-agent tool actually runs', async () => {
+    writeFileSync(join(tmp, 'config.json'), JSON.stringify(CFG));
+    const sent: OutgoingMessage[] = [];
+    const edits: Array<{ messageId: string; msg: OutgoingMessage }> = [];
+    const adapter = interactiveAdapter('telegram', sent, edits);
+    h = await bootstrapDaemon({ home: tmp, imAdapters: [adapter] });
+    const sock = daemonSocketPath(tmp);
+
+    await request(
+      {
+        kind: 'hook.permission.request', cwd: '/w', sessionId: 's1', agentId: 'a-77',
+        toolName: 'Bash', input: { command: 'rm -rf /tmp/scratch' }, timeoutSec: 60,
+      },
+      { socketPath: sock, timeoutMs: 5000 },
+    );
+    await waitForSent(sent);
+
+    // The answer happened at the keyboard; the tool then ran, which is the only
+    // thing tlive ever learns about the outcome.
+    await request(
+      { kind: 'hook.event', event: { event: 'activity', cwd: '/w', sessionId: 's1', agentId: 'a-77', toolName: 'Bash', result: {} } },
+      { socketPath: sock, timeoutMs: 2000 },
+    );
+
+    await until(() => { expect(edits.length).toBeGreaterThanOrEqual(1); });
+    expect(JSON.stringify(edits[0].msg)).toMatch(/ran at the terminal/i);
+  });
+
+  // Cards must not lie: the title says the tool RAN, so the body must not
+  // still say it is WAITING to be answered (real Telegram screenshot — the
+  // retirement edit used to reuse the exact same body text, waiting sentence
+  // included). The tool/input content must survive the edit though — that's
+  // the whole point of keeping the body at all, so you can look back and see
+  // what ran.
+  it('the retirement edit body does not still say "waiting" once the title says the tool ran', async () => {
+    writeFileSync(join(tmp, 'config.json'), JSON.stringify(CFG));
+    const sent: OutgoingMessage[] = [];
+    const edits: Array<{ messageId: string; msg: OutgoingMessage }> = [];
+    const adapter = interactiveAdapter('telegram', sent, edits);
+    h = await bootstrapDaemon({ home: tmp, imAdapters: [adapter] });
+    const sock = daemonSocketPath(tmp);
+
+    await request(
+      {
+        kind: 'hook.permission.request', cwd: '/w', sessionId: 's1', agentId: 'a-77',
+        toolName: 'Bash', input: { command: 'rm -rf /tmp/scratch' }, timeoutSec: 60,
+      },
+      { socketPath: sock, timeoutMs: 5000 },
+    );
+    await waitForSent(sent);
+
+    await request(
+      { kind: 'hook.event', event: { event: 'activity', cwd: '/w', sessionId: 's1', agentId: 'a-77', toolName: 'Bash', result: {} } },
+      { socketPath: sock, timeoutMs: 2000 },
+    );
+    await until(() => { expect(edits.length).toBeGreaterThanOrEqual(1); });
+
+    const card = edits[0].msg as { title?: string; body?: string };
+    expect(card.title).toContain('Bash'); // "<tool> · sub-agent · ran at the terminal"
+    expect(card.title).toContain('ran at the terminal');
+    expect(card.body).not.toContain('Waiting at the terminal');
+    // the tool content survives the edit — that's the point of keeping body at all.
+    expect(card.body).toContain('rm -rf /tmp/scratch');
+  });
+
+  it('leaves the notice alone when a DIFFERENT sub-agent runs the same tool', async () => {
+    writeFileSync(join(tmp, 'config.json'), JSON.stringify(CFG));
+    const sent: OutgoingMessage[] = [];
+    const edits: Array<{ messageId: string; msg: OutgoingMessage }> = [];
+    const adapter = interactiveAdapter('telegram', sent, edits);
+    h = await bootstrapDaemon({ home: tmp, imAdapters: [adapter] });
+    const sock = daemonSocketPath(tmp);
+
+    await request(
+      {
+        kind: 'hook.permission.request', cwd: '/w', sessionId: 's1', agentId: 'a-77',
+        toolName: 'Bash', input: { command: 'rm -rf /tmp/scratch' }, timeoutSec: 60,
+      },
+      { socketPath: sock, timeoutMs: 5000 },
+    );
+    await waitForSent(sent);
+
+    // A sibling sub-agent's Bash. Parallel sub-agents share key + toolName, so
+    // ignoring agentId here would retire the wrong notice.
+    await request(
+      { kind: 'hook.event', event: { event: 'activity', cwd: '/w', sessionId: 's1', agentId: 'a-99', toolName: 'Bash', result: {} } },
+      { socketPath: sock, timeoutMs: 2000 },
+    );
+    await new Promise((r) => setTimeout(r, 120));
+    expect(edits).toEqual([]);
+  });
+
+  async function findSession(sock: string, id: string) {
+    const r = await request({ kind: 'session.list' }, { socketPath: sock, timeoutMs: 2000 });
+    if (r.kind !== 'session.list') throw new Error('bad reply');
+    return r.sessions.find((s) => s.id === id);
+  }
+
+  // The IM notice (above) is only half the gap: with no IM configured, or
+  // `/mute` on, or the user simply not looking at their phone, a blocked
+  // sub-agent used to produce NO signal at all. The desktop toast is
+  // precisely the "at this machine, not watching the terminal" channel.
+  it('fires ONE desktop ping naming the tool when a sub-agent request passes through', async () => {
+    writeFileSync(join(tmp, 'config.json'), JSON.stringify(CFG));
+    const sent: OutgoingMessage[] = [];
+    const adapter = interactiveAdapter('telegram', sent);
+    const notes: Array<{ title: string; body: string }> = [];
+    h = await bootstrapDaemon({ home: tmp, imAdapters: [adapter], desktopNotifier: { ping: async (title, body) => { notes.push({ title, body }); }, clear: async () => {}, info: async () => {} } });
+    const sock = daemonSocketPath(tmp);
+
+    await request(
+      {
+        kind: 'hook.permission.request', cwd: '/w', sessionId: 's1', agentId: 'a-77',
+        toolName: 'Bash', input: { command: 'rm -rf /tmp/scratch' }, timeoutSec: 60,
+      },
+      { socketPath: sock, timeoutMs: 5000 },
+    );
+
+    await until(() => { expect(notes).toHaveLength(1); });
+    expect(notes[0].title).toContain('Bash');
+    expect(notes[0].title).toContain('sub-agent');
+    expect(notes[0].body).toContain('Waiting at the terminal');
+  });
+
+  // Same call-site-ordering bug as onPending above, the other flagged site:
+  // onPassthrough's desktop ping also renders sessionTag(key) before its own
+  // guarded upsert registered the session, so a sub-agent's first-ever
+  // pass-through (e.g. right after a daemon restart) produced an unlabelled toast.
+  it('a sub-agent pass-through for a never-before-seen session still carries the "<label> · " toast prefix', async () => {
+    writeFileSync(join(tmp, 'config.json'), JSON.stringify(CFG));
+    const sent: OutgoingMessage[] = [];
+    const adapter = interactiveAdapter('telegram', sent);
+    const notes: Array<{ title: string; body: string }> = [];
+    h = await bootstrapDaemon({ home: tmp, imAdapters: [adapter], desktopNotifier: { ping: async (title, body) => { notes.push({ title, body }); }, clear: async () => {}, info: async () => {} } });
+    const sock = daemonSocketPath(tmp);
+    expect(h.sessions.get('s1')).toBeUndefined();
+
+    await request(
+      {
+        kind: 'hook.permission.request', cwd: '/fresh-subagent-project', sessionId: 's1', agentId: 'a-77',
+        toolName: 'Bash', input: { command: 'rm -rf /tmp/scratch' }, timeoutSec: 60,
+      },
+      { socketPath: sock, timeoutMs: 5000 },
+    );
+
+    await until(() => { expect(notes).toHaveLength(1); });
+    expect(notes[0].title.startsWith('fresh-subagent-project · ')).toBe(true);
+  });
+
+  // The waiting sentence uses *italic* (telegram-html.ts's supported emphasis),
+  // NOT _italic_ — the renderer deliberately does not support underscore
+  // emphasis (ordinary snake_case/file_path content would turn italic), so the
+  // raw underscores used to leak into the message verbatim (real Telegram
+  // screenshot). Runs the actual live notice body through the real converter
+  // rather than asserting on the raw source string, so this cannot regress
+  // silently if the sentence is ever reworded.
+  it('the live notice body renders to <i>…</i> through the Telegram converter — no stray underscore reaches the user', async () => {
+    writeFileSync(join(tmp, 'config.json'), JSON.stringify(CFG));
+    const sent: OutgoingMessage[] = [];
+    const adapter = interactiveAdapter('telegram', sent);
+    h = await bootstrapDaemon({ home: tmp, imAdapters: [adapter] });
+    const sock = daemonSocketPath(tmp);
+
+    await request(
+      {
+        kind: 'hook.permission.request', cwd: '/w', sessionId: 's1', agentId: 'a-77',
+        toolName: 'Bash', input: { command: 'rm -rf /tmp/scratch' }, timeoutSec: 60,
+      },
+      { socketPath: sock, timeoutMs: 5000 },
+    );
+    await waitForSent(sent);
+    const card = sent[0] as { kind: 'card'; body?: string };
+    const html = mdToTelegramHtml(card.body ?? '');
+    expect(html).toContain('<i>');
+    expect(html).not.toContain('_');
+  });
+
+  // IM ⊥ desktop: `/mute` is an IM-only switch. The old early-return at the
+  // top of onPassthrough killed the WHOLE announcement on mute, which broke
+  // that rule for this notice specifically.
+  it('IM mute silences the card, but the desktop ping still fires (IM ⊥ desktop)', async () => {
+    writeFileSync(join(tmp, 'config.json'), JSON.stringify(CFG));
+    const sent: OutgoingMessage[] = [];
+    const adapter = interactiveAdapter('telegram', sent);
+    const notes: Array<{ title: string; body: string }> = [];
+    h = await bootstrapDaemon({ home: tmp, imAdapters: [adapter], desktopNotifier: { ping: async (title, body) => { notes.push({ title, body }); }, clear: async () => {}, info: async () => {} } });
+    const sock = daemonSocketPath(tmp);
+
+    await request({ kind: 'daemon.set', key: 'mute', enabled: true }, { socketPath: sock, timeoutMs: 2000 }); // /mute on
+
+    await request(
+      {
+        kind: 'hook.permission.request', cwd: '/w', sessionId: 's1', agentId: 'a-77',
+        toolName: 'Bash', input: { command: 'rm -rf /tmp/scratch' }, timeoutSec: 60,
+      },
+      { socketPath: sock, timeoutMs: 5000 },
+    );
+
+    await until(() => { expect(notes).toHaveLength(1); }); // desktop unaffected by IM mute…
+    await new Promise((r) => setTimeout(r, 80));
+    expect(sent).toHaveLength(0); // …but the IM card never went out
+  });
+
+  // Reuses the same read-only shape as the notify-mode local-prompt card
+  // (`local: true`) — there is no held request behind it, so Allow/Deny would
+  // be a button that cannot work. The registry holds ONE pending slot per
+  // session key, so a sub-agent notice must never evict an already-held
+  // main-session approval.
+  it('upserts a read-only dashboard card, but never evicts an already-held main-session approval', async () => {
+    writeFileSync(join(tmp, 'config.json'), JSON.stringify(CFG));
+    const sent: OutgoingMessage[] = [];
+    const adapter = interactiveAdapter('telegram', sent);
+    h = await bootstrapDaemon({ home: tmp, imAdapters: [adapter] });
+    const sock = daemonSocketPath(tmp);
+
+    // Fresh session, nothing held — the pass-through alone creates the card.
+    await request(
+      {
+        kind: 'hook.permission.request', cwd: '/w', sessionId: 's1', agentId: 'a-77',
+        toolName: 'Bash', input: { command: 'rm -rf /tmp/scratch' }, timeoutSec: 60,
+      },
+      { socketPath: sock, timeoutMs: 5000 },
+    );
+    const s1 = await findSession(sock, 's1');
+    expect(s1?.pending?.local).toBe(true);
+    expect(s1?.pending?.title).toContain('sub-agent');
+    expect(s1?.pending?.requestId).toContain('a-77');
+
+    // A held MAIN-session approval (no agentId) already owns 's2' — a
+    // sub-agent notice for the SAME key must not steal the pending slot.
+    const heldMain = held(request(
+      { kind: 'hook.permission.request', cwd: '/w2', sessionId: 's2', toolName: 'Bash', input: { command: 'ls' }, timeoutSec: 60 },
+      { socketPath: sock, timeoutMs: 10_000 },
+    ));
+    await waitForSent(sent);
+    const before = await findSession(sock, 's2');
+    const heldRequestId = before?.pending?.requestId;
+    expect(heldRequestId).toBeTruthy();
+    expect(before?.pending?.local).toBeUndefined(); // the answerable card
+
+    await request(
+      {
+        kind: 'hook.permission.request', cwd: '/w2', sessionId: 's2', agentId: 'a-88',
+        toolName: 'Read', input: { file_path: '/etc/hosts' }, timeoutSec: 60,
+      },
+      { socketPath: sock, timeoutMs: 5000 },
+    );
+    const after = await findSession(sock, 's2');
+    expect(after?.pending?.requestId).toBe(heldRequestId); // untouched — never overwritten
+    void heldMain; // resolved by the daemon's own shutdown() → settleAllPending
+  });
+
+  // Retirement (measured live: the sub-agent's PostToolUse carrying the same
+  // (agentId, toolName) pair) must close BOTH the dashboard card and the
+  // desktop toast when nothing else is waiting — and must not close the toast
+  // early when a held approval elsewhere is still pending, since the toast is
+  // one shared machine-wide slot.
+  it('a matching PostToolUse clears the dashboard card and closes the toast — but not while a held approval is still pending', async () => {
+    writeFileSync(join(tmp, 'config.json'), JSON.stringify(CFG));
+    const sent: OutgoingMessage[] = [];
+    const adapter = interactiveAdapter('telegram', sent);
+    const notes: Array<{ title: string; body: string }> = [];
+    const clears: number[] = [];
+    h = await bootstrapDaemon({ home: tmp, imAdapters: [adapter], desktopNotifier: { ping: async (title, body) => { notes.push({ title, body }); }, clear: async () => { clears.push(1); }, info: async () => {} } });
+    const sock = daemonSocketPath(tmp);
+
+    // Nothing else pending: retirement closes both surfaces.
+    await request(
+      {
+        kind: 'hook.permission.request', cwd: '/w', sessionId: 's1', agentId: 'a-77',
+        toolName: 'Bash', input: { command: 'rm -rf /tmp/scratch' }, timeoutSec: 60,
+      },
+      { socketPath: sock, timeoutMs: 5000 },
+    );
+    await until(() => { expect(notes).toHaveLength(1); });
+    await request(
+      { kind: 'hook.event', event: { event: 'activity', cwd: '/w', sessionId: 's1', agentId: 'a-77', toolName: 'Bash', result: {} } },
+      { socketPath: sock, timeoutMs: 2000 },
+    );
+    await until(() => { expect(clears.length).toBeGreaterThan(0); });
+    expect((await findSession(sock, 's1'))?.pending).toBeUndefined();
+
+    // A held main-session approval on a DIFFERENT session is still
+    // outstanding when THIS session's sub-agent notice retires.
+    const heldMain = held(request(
+      { kind: 'hook.permission.request', cwd: '/w2', sessionId: 's2', toolName: 'Bash', input: { command: 'ls' }, timeoutSec: 60 },
+      { socketPath: sock, timeoutMs: 10_000 },
+    ));
+    await until(() => { expect(notes.length).toBeGreaterThanOrEqual(2); });
+    clears.length = 0;
+
+    await request(
+      {
+        kind: 'hook.permission.request', cwd: '/w3', sessionId: 's3', agentId: 'a-99',
+        toolName: 'Read', input: { file_path: '/etc/hosts' }, timeoutSec: 60,
+      },
+      { socketPath: sock, timeoutMs: 5000 },
+    );
+    await until(() => { expect(notes.length).toBeGreaterThanOrEqual(3); });
+    expect((await findSession(sock, 's3'))?.pending?.local).toBe(true);
+
+    await request(
+      { kind: 'hook.event', event: { event: 'activity', cwd: '/w3', sessionId: 's3', agentId: 'a-99', toolName: 'Read', result: {} } },
+      { socketPath: sock, timeoutMs: 2000 },
+    );
+    await new Promise((r) => setTimeout(r, 100));
+    expect(clears).toEqual([]); // s2's held approval still pending → toast stays open
+    expect((await findSession(sock, 's3'))?.pending).toBeUndefined(); // s3's own card still retires
+    void heldMain; // resolved by the daemon's own shutdown() → settleAllPending
+  });
+
+  // Regression: the desktop-clear condition must be ONE predicate evaluated
+  // identically everywhere — not three separate copies. A copy that forgets
+  // passthruWaiting closes a still-outstanding sub-agent toast the INSTANT
+  // something else the daemon tracks resolves, anywhere. This drives that
+  // through onResolved specifically: s1's sub-agent dialog is untouched
+  // (nothing retires it in this test) while a genuinely separate, genuinely
+  // held main-session approval on s2 gets answered via IM.
+  it("a held approval resolving on ANOTHER session must not close the toast while a sub-agent pass-through is still outstanding (onResolved)", async () => {
+    writeFileSync(join(tmp, 'config.json'), JSON.stringify(CFG));
+    const sent: OutgoingMessage[] = [];
+    const adapter = interactiveAdapter('telegram', sent);
+    const notes: Array<{ title: string; body: string }> = [];
+    const clears: number[] = [];
+    h = await bootstrapDaemon({ home: tmp, imAdapters: [adapter], desktopNotifier: { ping: async (title, body) => { notes.push({ title, body }); }, clear: async () => { clears.push(1); }, info: async () => {} } });
+    const sock = daemonSocketPath(tmp);
+
+    // s1: sub-agent pass-through — still outstanding for the rest of this test.
+    await request(
+      {
+        kind: 'hook.permission.request', cwd: '/w', sessionId: 's1', agentId: 'a-77',
+        toolName: 'Bash', input: { command: 'rm -rf /tmp/scratch' }, timeoutSec: 60,
+      },
+      { socketPath: sock, timeoutMs: 5000 },
+    );
+    await until(() => { expect(notes).toHaveLength(1); });
+
+    // s2: a genuine held MAIN-session approval, answered via IM → onResolved fires.
+    const pending = request(
+      { kind: 'hook.permission.request', cwd: '/w2', sessionId: 's2', toolName: 'Bash', input: { command: 'ls' }, timeoutSec: 60 },
+      { socketPath: sock, timeoutMs: 10_000 },
+    );
+    held(pending);
+    // sent[] also carries s1's pass-through IM notice (its own "mode:all"
+    // button) — find the actual approvable card, not just sent[0].
+    await vi.waitFor(() => {
+      expect((sent as Array<{ buttons?: Array<{ id: string }> }>).some((m) => m.buttons?.some((b) => b.id.startsWith('approve:')))).toBe(true);
+    }, { timeout: 3000, interval: 10 });
+    const card = (sent as Array<{ buttons?: Array<{ id: string; label: string }> }>).find((m) => m.buttons?.some((b) => b.id.startsWith('approve:')))!;
+    adapter.fire({ channel: 'telegram', chatId: 'c1', userId: 'u1', messageId: 'x1', text: card.buttons!.find((b) => b.id.startsWith('approve:'))!.id, ts: 0 });
+    await pending;
+
+    // s2's own approval just resolved — s1's sub-agent dialog is still
+    // unanswered at the terminal, so the toast must NOT have closed.
+    expect(clears).toEqual([]);
+
+    // Only once s1's notice actually retires does the toast close.
+    await request(
+      { kind: 'hook.event', event: { event: 'activity', cwd: '/w', sessionId: 's1', agentId: 'a-77', toolName: 'Bash', result: {} } },
+      { socketPath: sock, timeoutMs: 2000 },
+    );
+    await until(() => { expect(clears.length).toBeGreaterThan(0); });
+  });
+
+  // Mirrors the test above for the OTHER pre-existing copy of the condition:
+  // clearLocalPrompt (the notify-mode / full-mode-defer CC-native dialog
+  // tracker) must not close the toast either, while a sub-agent pass-through
+  // elsewhere is still outstanding. mode: 'notify' is required to get a
+  // tracked local prompt at all — 'full' treats permission_prompt as
+  // redundant and never calls localPrompts.note in the first place.
+  it('clearing a local prompt on ANOTHER session must not close the toast while a sub-agent pass-through is still outstanding (clearLocalPrompt)', async () => {
+    writeFileSync(join(tmp, 'config.json'), JSON.stringify({ ...CFG, mode: 'notify' }));
+    const sent: OutgoingMessage[] = [];
+    const adapter = interactiveAdapter('telegram', sent);
+    const notes: Array<{ title: string; body: string }> = [];
+    const clears: number[] = [];
+    h = await bootstrapDaemon({ home: tmp, imAdapters: [adapter], desktopNotifier: { ping: async (title, body) => { notes.push({ title, body }); }, clear: async () => { clears.push(1); }, info: async () => {} } });
+    const sock = daemonSocketPath(tmp);
+
+    // s1: sub-agent pass-through — still outstanding for the rest of this test.
+    await request(
+      {
+        kind: 'hook.permission.request', cwd: '/w', sessionId: 's1', agentId: 'a-77',
+        toolName: 'Bash', input: { command: 'rm -rf /tmp/scratch' }, timeoutSec: 60,
+      },
+      { socketPath: sock, timeoutMs: 5000 },
+    );
+    await until(() => { expect(notes).toHaveLength(1); });
+
+    // s2: a notify-mode CC-native dialog (no held request), tracked…
+    await request(
+      { kind: 'hook.notify', cwd: '/w2', sessionId: 's2', level: 'info', message: 'Claude needs your permission to use Bash', permissionPrompt: true },
+      { socketPath: sock, timeoutMs: 2000 },
+    );
+    await until(() => { expect(notes.length).toBeGreaterThanOrEqual(2); });
+
+    // …then answered at the keyboard → clearLocalPrompt fires.
+    await request(
+      { kind: 'hook.event', event: { event: 'activity', cwd: '/w2', sessionId: 's2', toolName: 'Bash', result: {} } },
+      { socketPath: sock, timeoutMs: 2000 },
+    );
+    await new Promise((r) => setTimeout(r, 100));
+    // s1's sub-agent dialog is still unanswered — the toast must NOT have closed.
+    expect(clears).toEqual([]);
+
+    // Only once s1's notice actually retires does the toast close.
+    await request(
+      { kind: 'hook.event', event: { event: 'activity', cwd: '/w', sessionId: 's1', agentId: 'a-77', toolName: 'Bash', result: {} } },
+      { socketPath: sock, timeoutMs: 2000 },
+    );
+    await until(() => { expect(clears.length).toBeGreaterThan(0); });
   });
 });
 
@@ -1054,15 +1584,22 @@ describe('permission_prompt forwarding — the notify-mode / immediate-defer not
     expect((sent[0] as { text: string }).text).toContain('answer in the terminal');
   });
 
-  // The baseline contract. In `full` mode every permission request tlive sees
-  // ends up either held (an answerable card owns IM) or deliberately passed
-  // through (sub-agent pass-through / policy allow). "Passed through" means "act
-  // as if tlive were not installed" — so an un-answerable "go look at your
-  // terminal" text is a message the baseline never sends, and it cannot be
-  // attributed anyway (CC's Notification input carries no agent_id and no
-  // tool_name). Desktop + dashboard are tlive's own surfaces, not additions to
-  // CC's output, so they stay.
-  it('full mode + no held card (tlive passed through) → desktop + dashboard, but NO IM text', async () => {
+  // In `full` mode every request tlive sees ends up either held (an answerable
+  // card owns every surface) or deliberately handed back. So a permission_prompt
+  // arriving with nothing held means tlive handed that one back — and for the
+  // only case that produces a dialog, a sub-agent pass-through, tlive has already
+  // pushed a notice naming the tool and its input. This event adds nothing: it
+  // carries no tool_name and no agent_id, so it cannot even say which dialog it
+  // means.
+  //
+  // Building the chain from it anyway is what produced a card that never went
+  // away: retiring it needs the answer, and the only signal tlive gets is the
+  // sub-agent's PostToolUse, which is skipped here precisely because it carries an
+  // agentId (a sibling's activity must not retire the main session's reminder).
+  // Measured live: a workflow session sat at `status: active` with a "Permission
+  // needed" card still on it, because every event in that session was a
+  // sub-agent's. Don't create it, and there is nothing to retire.
+  it('full mode: a permission_prompt with nothing held creates no card, toast or IM text', async () => {
     writeFileSync(join(tmp, 'config.json'), JSON.stringify({ ...CFG, mode: 'full' }));
     const sent: OutgoingMessage[] = [];
     const adapter = interactiveAdapter('telegram', sent);
@@ -1072,10 +1609,58 @@ describe('permission_prompt forwarding — the notify-mode / immediate-defer not
 
     await request({ kind: 'hook.notify', cwd: '/w', sessionId: 's1', level: 'info', message: MSG, permissionPrompt: true }, { socketPath: sock, timeoutMs: 2000 });
 
+    await new Promise((r) => setTimeout(r, 80));
+    expect(notes).toEqual([]);
+    expect((await findSession(sock, 's1'))?.pending ?? null).toBeNull();
+    expect(sent).toHaveLength(0);
+  });
+
+  // Mirrors the 'full mode' test above for the top rung: 'all' is ALSO a
+  // holding posture (every request tlive saw was held or handed back), so it
+  // must behave identically. Before the fix, `redundant` was computed from
+  // `mode === 'full'` alone, so 'all' fell through as `redundant = false` and
+  // built the chain anyway in a posture where it must not run (see the
+  // comment above `redundant` in bootstrap.ts).
+  it('all mode: a permission_prompt with nothing held ALSO creates no card, toast or IM text', async () => {
+    writeFileSync(join(tmp, 'config.json'), JSON.stringify({ ...CFG, mode: 'all' }));
+    const sent: OutgoingMessage[] = [];
+    const adapter = interactiveAdapter('telegram', sent);
+    const notes: Array<{ title: string; body: string }> = [];
+    h = await bootstrapDaemon({ home: tmp, imAdapters: [adapter], desktopNotifier: { ping: async (title, body) => { notes.push({ title, body }); }, clear: async () => {}, info: async () => {} } });
+    const sock = daemonSocketPath(tmp);
+
+    await request({ kind: 'hook.notify', cwd: '/w', sessionId: 's1', level: 'info', message: MSG, permissionPrompt: true }, { socketPath: sock, timeoutMs: 2000 });
+
+    await new Promise((r) => setTimeout(r, 80));
+    expect(notes).toEqual([]);
+    expect((await findSession(sock, 's1'))?.pending ?? null).toBeNull();
+    expect(sent).toHaveLength(0);
+  });
+
+  // The regression this describe block exists to guard against: the posture is
+  // remotely settable (`tlive mode`, IM's `/mode`) and must never be cached at
+  // boot. Boot in `full`, then flip to `notify` — exactly "tap `notify` on the
+  // ladder card while a boot-time-`full` daemon is still running" — and this
+  // chain must run per the CURRENT posture, not the boot one. The old
+  // `const mode = effectiveMode(cfg.mode)` (read once at boot) would have left
+  // `redundant` stuck `true` here, silently re-opening issue #49.
+  it('a posture change made AFTER boot changes whether this chain runs — not the boot-time posture', async () => {
+    writeFileSync(join(tmp, 'config.json'), JSON.stringify({ ...CFG, mode: 'full' }));
+    const sent: OutgoingMessage[] = [];
+    const adapter = interactiveAdapter('telegram', sent);
+    const notes: Array<{ title: string; body: string }> = [];
+    h = await bootstrapDaemon({ home: tmp, imAdapters: [adapter], desktopNotifier: { ping: async (title, body) => { notes.push({ title, body }); }, clear: async () => {}, info: async () => {} } });
+    const sock = daemonSocketPath(tmp);
+
+    writeMode(tmp, 'notify');
+
+    await request({ kind: 'hook.notify', cwd: '/w', sessionId: 's1', level: 'info', message: MSG, permissionPrompt: true }, { socketPath: sock, timeoutMs: 2000 });
+
+    // Now on 'notify' — the chain must run: it is the only signal a dialog is waiting.
     expect(notes).toHaveLength(1);
     expect((await findSession(sock, 's1'))?.pending?.local).toBe(true);
-    await new Promise((r) => setTimeout(r, 80));
-    expect(sent).toHaveLength(0);
+    await waitForSent(sent);
+    expect((sent[0] as { text: string }).text).toContain('answer in the terminal');
   });
 
   it('notify mode still sends the IM text — there it is the only signal a dialog is waiting', async () => {
@@ -1167,5 +1752,124 @@ describe('permission_prompt forwarding — the notify-mode / immediate-defer not
     expect((await findSession(sock, 's1'))?.pending?.local).toBe(true);
     await new Promise((r) => setTimeout(r, 80));
     expect(sent).toHaveLength(0);
+  });
+});
+
+// bootstrap.ts's IPC layer maps BOTH 'local' and 'handback' to the wire
+// decision 'defer' (permission-router.ts keeps them as distinct Decision
+// values only so the settled card can tell them apart — see OUTCOME). Today
+// only a type error would catch that mapping line being removed, and at
+// runtime the shim would silently receive a `decision` it does not
+// understand. Assert the wire AND the settlement label directly.
+describe('handback (Answer at the terminal instead)', () => {
+  it('maps to defer on the wire, and settles the card as "Handed back to the terminal" — not "Timed out"', async () => {
+    writeFileSync(join(tmp, 'config.json'), JSON.stringify({
+      mode: 'all',
+      web: { enabled: false },
+      approvals: { approvalGraceSec: 0 },
+      adapters: { telegram: { token: 't', chatIdAllowList: ['c1'] } },
+    }));
+    const sent: OutgoingMessage[] = [];
+    const edits: Array<{ messageId: string; msg: OutgoingMessage }> = [];
+    const adapter = interactiveAdapter('telegram', sent, edits);
+    h = await bootstrapDaemon({ home: tmp, imAdapters: [adapter] });
+    const sock = daemonSocketPath(tmp);
+
+    const pending = held(request(
+      { kind: 'hook.permission.request', cwd: '/proj', sessionId: 's1', agentId: 'agentA', toolName: 'Bash', input: { command: 'date' }, timeoutSec: 60 },
+      { socketPath: sock, timeoutMs: 10_000 },
+    ));
+    await waitForSent(sent);
+
+    const card = sent[0] as { kind: 'card'; buttons?: Array<{ id: string; label: string }> };
+    const handbackBtn = card.buttons!.find((b) => b.id.startsWith('handback:'))!;
+    adapter.fire({ channel: 'telegram', chatId: 'c1', userId: 'u1', messageId: 'x1', text: handbackBtn.id, ts: 0 });
+
+    // The wire: CC must see a plain pass-through, exactly like a timeout/local
+    // answer — never a decision it doesn't recognize, never an auto-allow.
+    const r = await pending;
+    expect(r).toEqual({ kind: 'hook.permission.result', decision: 'defer' });
+
+    // The card: the distinct label is the entire justification for 'handback'
+    // existing as its own Decision instead of just reusing 'defer' (whose
+    // settlement label is "Timed out" — a lie here, nobody waited it out).
+    expect(edits).toHaveLength(1);
+    const edited = edits[0].msg as { title?: string };
+    expect(edited.title).toContain('Handed back to the terminal');
+    expect(edited.title).not.toContain('Timed out');
+  });
+});
+
+describe('sub-agent card affordances', () => {
+  it('on mode all, a held sub-agent card offers a way back to the terminal and a posture switch', async () => {
+    writeFileSync(join(tmp, 'config.json'), JSON.stringify({
+      mode: 'all',
+      web: { enabled: false },
+      approvals: { approvalGraceSec: 0 },
+      adapters: { telegram: { token: 't', chatIdAllowList: ['c1'] } },
+    }));
+    const sent: OutgoingMessage[] = [];
+    h = await bootstrapDaemon({ home: tmp, imAdapters: [interactiveAdapter('telegram', sent)] });
+    const pending = held(request({ kind: 'hook.permission.request', cwd: '/proj', sessionId: 's1', toolName: 'Bash', input: { command: 'date' }, agentId: 'agentA' },
+      { socketPath: daemonSocketPath(tmp), timeoutMs: 4000 }));
+    await waitForSent(sent);
+
+    const card = sent[0] as Extract<OutgoingMessage, { kind: 'card' }>;
+    const ids = card.buttons!.map((b) => b.id);
+    expect(ids.some((i) => i.startsWith('handback:'))).toBe(true);
+    expect(ids).toContain('mode:full');
+    // Task 13 defect 2: a HELD sub-agent card must mark itself as such — it has
+    // no parallel terminal dialog while held, unlike a main-session card, and
+    // the two must not read as indistinguishable (matches the pass-through
+    // notice's own `${toolName} · sub-agent` idiom).
+    expect(card.title).toContain('sub-agent');
+
+    h.permissionRouter.cancel({ key: 's1' });
+    await pending;
+  });
+
+  it('on mode full, the sub-agent pass-through notice offers to start holding them', async () => {
+    writeFileSync(join(tmp, 'config.json'), JSON.stringify({
+      mode: 'full',
+      web: { enabled: false },
+      approvals: { approvalGraceSec: 0 },
+      adapters: { telegram: { token: 't', chatIdAllowList: ['c1'] } },
+    }));
+    const sent: OutgoingMessage[] = [];
+    h = await bootstrapDaemon({ home: tmp, imAdapters: [interactiveAdapter('telegram', sent)] });
+    const r = await request({ kind: 'hook.permission.request', cwd: '/proj', sessionId: 's1', toolName: 'Read', input: { file_path: '/etc/hosts' }, agentId: 'agentA' },
+      { socketPath: daemonSocketPath(tmp), timeoutMs: 4000 });
+    expect(r.kind === 'hook.permission.result' && r.decision).toBe('defer'); // still transparent
+    await waitForSent(sent);
+
+    const notice = sent[0] as Extract<OutgoingMessage, { kind: 'card' }>;
+    expect(notice.buttons?.map((b) => b.id)).toEqual(['mode:all']);
+    // The notice must NOT offer Allow/Deny — that dialog can only be answered at
+    // the keyboard, and an affordance that cannot work is worse than none.
+    expect(notice.buttons?.some((b) => b.id.startsWith('approve:'))).toBe(false);
+  });
+
+  it('a main-session card keeps exactly its old button set', async () => {
+    writeFileSync(join(tmp, 'config.json'), JSON.stringify({
+      mode: 'full',
+      web: { enabled: false },
+      approvals: { approvalGraceSec: 0 },
+      adapters: { telegram: { token: 't', chatIdAllowList: ['c1'] } },
+    }));
+    const sent: OutgoingMessage[] = [];
+    h = await bootstrapDaemon({ home: tmp, imAdapters: [interactiveAdapter('telegram', sent)] });
+    const pending = held(request({ kind: 'hook.permission.request', cwd: '/proj', sessionId: 's1', toolName: 'Bash', input: { command: 'date' } },
+      { socketPath: daemonSocketPath(tmp), timeoutMs: 4000 }));
+    await waitForSent(sent);
+
+    const card = sent[0] as Extract<OutgoingMessage, { kind: 'card' }>;
+    const ids = card.buttons!.map((b) => b.id.split(':')[0]);
+    expect(ids).toEqual(['approve', 'deny', 'allowtool', 'pause']);
+    // Task 13 defect 2: a main-session card has a live parallel terminal dialog
+    // (first answer wins) — it must NOT be marked as a sub-agent card.
+    expect(card.title).not.toContain('sub-agent');
+
+    h.permissionRouter.cancel({ key: 's1' });
+    await pending;
   });
 });

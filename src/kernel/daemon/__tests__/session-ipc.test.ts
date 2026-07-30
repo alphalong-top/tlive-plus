@@ -1,6 +1,6 @@
 // src/kernel/daemon/__tests__/session-ipc.test.ts
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { bootstrapDaemon, type DaemonHandle } from '../bootstrap';
@@ -8,6 +8,7 @@ import { request, daemonSocketPath } from '../../ipc/client';
 import type { SessionMeta } from '../../ipc/protocol';
 import type { IMAdapter, OutgoingMessage } from '../../contracts/im-adapter';
 import { until } from '../../__tests__/wait.js';
+import { writeMode } from '../../config/mode.js';
 
 const recordingAdapter = (sent: OutgoingMessage[]): IMAdapter => ({
   channel: 'telegram',
@@ -58,12 +59,13 @@ describe('session.* over IPC', () => {
 describe('parent-session teardown must be agent-scoped (backgrounded sub-agent approval survival)', () => {
   // A configured chat keeps requestPermission pending; with no injected imAdapters
   // sendToChat is a no-op (no network), so the pending simply sits in the router.
-  // holdSubagents:true — these tests exercise the *held* sub-agent path (the
-  // cancel-scoping fix). By default sub-agents pass through (no pending to protect),
-  // so remote-hold must be opted in to create a backgrounded sub-agent card at all.
+  // mode:'all' — these tests exercise the *held* sub-agent path (the cancel-scoping
+  // fix). On 'full' sub-agents pass through (no pending to protect), so the top
+  // rung has to be on to create a backgrounded sub-agent card at all.
   const writeConfig = () => writeFileSync(join(tmp, 'config.json'), JSON.stringify({
+    mode: 'all',
     adapters: { telegram: { token: 't', chatIdAllowList: ['c1'] } },
-    approvals: { approvalGraceSec: 0, continueGraceSec: 0, continueWindowSec: 30, holdSubagents: true },
+    approvals: { approvalGraceSec: 0, continueGraceSec: 0, continueWindowSec: 30 },
   }));
   const fireSubAgentApproval = () =>
     request({ kind: 'hook.permission.request', cwd: '/proj', sessionId: 'parent', toolName: 'Bash', input: { command: 'date' }, agentId: 'subA' },
@@ -115,15 +117,65 @@ describe('parent-session teardown must be agent-scoped (backgrounded sub-agent a
     await Promise.all([sub, stop]);
   });
 
-  it('by default (holdSubagents off) a sub-agent approval passes through — no pending, tlive stays transparent', async () => {
-    // No holdSubagents in config → default false. A backgrounded sub-agent has no
+  it('on mode full a sub-agent approval passes through — no pending, tlive stays transparent', async () => {
+    // 'full' holds the main session only. A backgrounded sub-agent has no
     // parallel local dialog while a sync hook is held, so holding it would block it
     // with no fallback; instead tlive defers (shim {} → CC-native handling).
     writeFileSync(join(tmp, 'config.json'), JSON.stringify({
+      mode: 'full',
       adapters: { telegram: { token: 't', chatIdAllowList: ['c1'] } },
       approvals: { approvalGraceSec: 0, continueGraceSec: 0, continueWindowSec: 30 },
     }));
     h = await bootstrapDaemon({ home: tmp });
+    const res = await request({ kind: 'hook.permission.request', cwd: '/proj', sessionId: 'parent', toolName: 'Bash', input: { command: 'date' }, agentId: 'subA' },
+      { socketPath: sock, timeoutMs: 4000 });
+    expect(res.kind === 'hook.permission.result' && res.decision).toBe('defer');
+    expect(h.permissionRouter.pendingCount()).toBe(0);
+  });
+
+  it('picks up a posture change made AFTER boot — no daemon restart', async () => {
+    // The shim re-reads config.json on every hook, so the daemon must too: a
+    // `tlive mode all` at the terminal (or /mode from IM) has to change what the
+    // NEXT approval does. Before this, cfg was read once at boot and the sub-agent
+    // branch kept the boot-time posture forever.
+    writeFileSync(join(tmp, 'config.json'), JSON.stringify({
+      mode: 'full',
+      adapters: { telegram: { token: 't', chatIdAllowList: ['c1'] } },
+      approvals: { approvalGraceSec: 0, continueGraceSec: 0, continueWindowSec: 30 },
+    }));
+    h = await bootstrapDaemon({ home: tmp });
+
+    const passed = await request({ kind: 'hook.permission.request', cwd: '/proj', sessionId: 'parent', toolName: 'Bash', input: { command: 'date' }, agentId: 'subA' },
+      { socketPath: sock, timeoutMs: 4000 });
+    expect(passed.kind === 'hook.permission.result' && passed.decision).toBe('defer');
+
+    writeMode(tmp, 'all');
+
+    const held = fireSubAgentApproval();
+    await until(() => { expect(h.permissionRouter.pendingCount()).toBe(1); });
+    h.permissionRouter.cancel({ key: 'parent' });
+    await held;
+  });
+
+  it('config.json deleted after boot resolves like a fresh install (notify), not the boot-time mode', async () => {
+    // Deleting config.json is not "config unreadable, so guess the last known
+    // posture" — loadConfig's DEFAULT branch for a missing file never throws,
+    // so currentMode() takes the SAME path the hook shim's readMode() does for
+    // the identical (absent) file and lands on the same 'notify' default —
+    // daemon and shim can never disagree over whether the file exists. This
+    // request only reaches the daemon because it bypasses the shim (direct
+    // IPC): in the real `tlive hook` path, modeShortCircuit('notify', …) would
+    // already have short-circuited the permission-request to `{}` before any
+    // IPC was even attempted, so this daemon-side value is unobservable there.
+    writeFileSync(join(tmp, 'config.json'), JSON.stringify({
+      mode: 'all',
+      adapters: { telegram: { token: 't', chatIdAllowList: ['c1'] } },
+      approvals: { approvalGraceSec: 0, continueGraceSec: 0, continueWindowSec: 30 },
+    }));
+    h = await bootstrapDaemon({ home: tmp });
+
+    rmSync(join(tmp, 'config.json'));
+
     const res = await request({ kind: 'hook.permission.request', cwd: '/proj', sessionId: 'parent', toolName: 'Bash', input: { command: 'date' }, agentId: 'subA' },
       { socketPath: sock, timeoutMs: 4000 });
     expect(res.kind === 'hook.permission.result' && res.decision).toBe('defer');

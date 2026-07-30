@@ -143,24 +143,29 @@ export function permissionRequestDecisionOut(decision: 'allow' | 'deny' | 'defer
 }
 
 
-/** tlive 姿态开关。full = 远程审批 + 监看(卖点全开);notify = 只监看/通知,
- *  PermissionRequest 绝不 gating(默认,安全:tlive 物理上无法 hold 任何审批);
- *  off = 全关 kill switch。shim 按此短路(见 modeShortCircuit)。 */
-export type ShimMode = 'off' | 'notify' | 'full';
+/** tlive 姿态梯子,单调递增:每一级都做前一级做的事,再多做一点。
+ *  off = 全关 kill switch;notify = 只监看/通知,PermissionRequest 绝不 gating
+ *  (默认,安全);full = hold 主会话审批(终端框并行,先答先得);all = 子代理
+ *  审批也 hold(hold 期间子代理**没有**终端框,所以这是"没人在键盘前"的姿态)。
+ *  shim 按此短路(见 modeShortCircuit);daemon 按此决定子代理拦不拦。 */
+export type ShimMode = 'off' | 'notify' | 'full' | 'all';
 
 /** Resolve a config `mode` value to the effective posture — the single source of
  *  the `notify` default. Unset / unknown / malformed all fall back to the safe
- *  `notify` (watch + notify, never gate). Used by both the shim (readMode) and
- *  `tlive status` so the displayed posture always matches the enforced one. */
+ *  `notify` (watch + notify, never gate). Used by the shim (readMode), the
+ *  daemon (currentMode) and `tlive status`, so the displayed posture always
+ *  matches the enforced one. */
 export function effectiveMode(m: unknown): ShimMode {
-  return m === 'off' || m === 'full' ? m : 'notify';
+  return m === 'off' || m === 'full' || m === 'all' ? m : 'notify';
 }
 
 /** session-start additionalContext(CC-only,Codex hooks 已退役)。分级引导:
  *  - IM 未配置 → 先引导配 IM(优先,没 IM 谈不上远程)。
- *  - IM 已配置但 mode≠full → 提示远程审批当前是关的,引导用 `tlive mode full` 打开
- *    (默认 notify 下的"卖点在一步之外"提示,兜住手动配了 IM 却没走 setup 的缝)。
- *  - IM 已配置且 full → {}(不打扰)。 */
+ *  - IM 已配置但 mode 既非 full 也非 all(即仍在默认的 notify)→ 提示远程审批
+ *    当前是关的,引导用 `tlive mode full` 打开(默认 notify 下的"卖点在一步之外"
+ *    提示,兜住手动配了 IM 却没走 setup 的缝)。full/all 都已经是"远程审批开着",
+ *    这里绝不能建议从 all 降级到 full——那是用户离开键盘前特意选的姿态。
+ *  - IM 已配置且 full 或 all → {}(不打扰)。 */
 export function sessionStartOut(vendor: HookVendor, imConfigured: boolean, mode: ShimMode): string {
   if (vendor !== 'claude') return '{}';
   if (!imConfigured) {
@@ -171,7 +176,7 @@ export function sessionStartOut(vendor: HookVendor, imConfigured: boolean, mode:
       },
     });
   }
-  if (mode !== 'full') {
+  if (mode !== 'full' && mode !== 'all') {
     return JSON.stringify({
       hookSpecificOutput: {
         hookEventName: 'SessionStart',

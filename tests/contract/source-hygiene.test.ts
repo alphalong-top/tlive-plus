@@ -1,0 +1,23 @@
+import { describe, it, expect } from 'vitest';
+import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { join } from 'node:path';
+
+/** A literal NUL byte makes `file` classify a source as binary and makes
+ *  grep/rg skip it entirely — the file drops out of every search in the repo
+ *  with no error anywhere. Use the six-character JSON-style escape
+ *  (backslash, u, 0, 0, 0, 0); same byte at runtime, still a text file to the tools. */
+function sources(dir: string, out: string[] = []): string[] {
+  for (const e of readdirSync(dir)) {
+    const p = join(dir, e);
+    if (statSync(p).isDirectory()) sources(p, out);
+    else if (p.endsWith('.ts') || p.endsWith('.mjs') || p.endsWith('.js')) out.push(p);
+  }
+  return out;
+}
+
+describe('source hygiene', () => {
+  it('no source file contains a literal NUL byte', () => {
+    const offenders = sources('src').concat(sources('tests')).filter((p) => readFileSync(p).includes(0));
+    expect(offenders).toEqual([]);
+  });
+});

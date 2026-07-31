@@ -16,14 +16,15 @@ function harness() {
   };
   const router = { requestPermission: vi.fn(async () => ({ decision: 'allow' })), cancel: vi.fn(() => 0) };
   const onMonitor = vi.fn();
+  const onResumePrompt = vi.fn();
   const comp = startCompanion({
     connect: async (e: any) => { events = e; return rpc as any; },
     permissionRouter: router as any,
     onMonitor,
-    onResumePrompt: vi.fn(),
+    onResumePrompt,
     windowSec: () => 86_400,
   });
-  return { rpc, router, onMonitor, comp, calls, getEvents: () => events, setEvents: (e: any) => { events = e; } };
+  return { rpc, router, onMonitor, onResumePrompt, comp, calls, getEvents: () => events, setEvents: (e: any) => { events = e; } };
 }
 
 describe('companion', () => {
@@ -252,6 +253,52 @@ describe('companion', () => {
     events.onNotify('item/completed', { threadId: 't1', item: { type: 'agentMessage', text: '' } });
     events.onNotify('turn/completed', { threadId: 't1' });
     expect(onResumePrompt).toHaveBeenLastCalledWith({ threadId: 't1', key: 'codex:t1', lastMessage: 'final answer' });
+    comp.stop();
+  });
+
+  it('waits through retryable errors, then reports the failed turn with the full error', async () => {
+    const { comp, onMonitor, onResumePrompt, getEvents } = harness();
+    await vi.runOnlyPendingTimersAsync();
+    await Promise.resolve();
+    await Promise.resolve();
+    onMonitor.mockClear();
+    const events = getEvents();
+    const error = {
+      message: 'unexpected status 503 Service Unavailable',
+      additionalDetails: 'Selected model is at capacity. Please try a different model.',
+    };
+
+    events.onNotify('error', { threadId: 't1', turnId: 'turn-1', willRetry: true, error });
+    expect(onResumePrompt).not.toHaveBeenCalled();
+
+    events.onNotify('turn/completed', {
+      threadId: 't1',
+      turn: { id: 'turn-1', status: 'failed', error: null },
+    });
+    const message = `${error.message}\n${error.additionalDetails}`;
+    expect(onMonitor).toHaveBeenCalledWith(
+      { event: 'attention', cwd: 'codex:t1', sessionId: 't1', message: `Codex turn failed: ${message}` },
+      'codex:t1',
+    );
+    expect(onResumePrompt).toHaveBeenCalledWith({ threadId: 't1', key: 'codex:t1', error: message });
+    comp.stop();
+  });
+
+  it('deduplicates final error and turn/completed notifications in either order', async () => {
+    const { comp, onResumePrompt, getEvents } = harness();
+    await vi.runOnlyPendingTimersAsync();
+    await Promise.resolve();
+    await Promise.resolve();
+    const events = getEvents();
+    const error = { message: 'unexpected status 503 Service Unavailable' };
+
+    events.onNotify('error', { threadId: 't1', turnId: 'turn-1', willRetry: false, error });
+    events.onNotify('turn/completed', { threadId: 't1', turn: { id: 'turn-1', status: 'failed', error } });
+    expect(onResumePrompt).toHaveBeenCalledTimes(1);
+
+    events.onNotify('turn/completed', { threadId: 't1', turn: { id: 'turn-2', status: 'failed', error } });
+    events.onNotify('error', { threadId: 't1', turnId: 'turn-2', willRetry: false, error });
+    expect(onResumePrompt).toHaveBeenCalledTimes(2);
     comp.stop();
   });
 

@@ -66,7 +66,7 @@ export function shouldDropNotify(continueId: string | null | undefined, level: '
   return level === 'info' && Boolean(continueId);
 }
 
-/** Codex `turn/completed` → offer the reply to whoever's watching (IM/web) via
+/** Codex terminal turn outcome → offer the reply to whoever's watching (IM/web) via
  *  ContinueBroker, then feed a non-null reply back into the thread via
  *  `turn/start`. Mirrors the `hook.continue.request` IPC handler minus the
  *  IPC reply — the ContinueBroker.onRequest handler already does the IM
@@ -79,10 +79,10 @@ export function makeCodexResumeHandler(deps: {
   chats: () => unknown[];
   resume: (threadId: string, input: string) => Promise<void>;
   continueWindowSec: () => number;
-}): (p: { threadId: string; key: string; lastMessage?: string }) => void {
+}): (p: { threadId: string; key: string; lastMessage?: string; error?: string }) => void {
   return (p) => {
     void (async () => {
-      const { threadId, key, lastMessage } = p;
+      const { threadId, key, lastMessage, error } = p;
       if (shouldFastNullContinue(deps.chats().length, deps.events.size())) {
         deps.events.broadcast({
           type: 'session-upsert',
@@ -94,7 +94,12 @@ export function makeCodexResumeHandler(deps: {
         type: 'session-upsert',
         session: deps.sessions.upsert({ key, cwd: key, status: 'waiting-input', ...(lastMessage ? { lastMessage } : {}) }),
       });
-      const reply = await deps.broker.request({ cwd: key, context: lastMessage ?? TURN_FINISHED_SENTINEL, timeoutSec: deps.continueWindowSec() });
+      const reply = await deps.broker.request({
+        cwd: key,
+        context: error ?? lastMessage ?? TURN_FINISHED_SENTINEL,
+        timeoutSec: deps.continueWindowSec(),
+        ...(error ? { failed: true } : {}),
+      });
       if (reply) {
         deps.resume(threadId, reply).catch((e) => console.log('[codex] resume failed: ' + (e instanceof Error ? e.message : String(e))));
         deps.events.broadcast({ type: 'session-upsert', session: deps.sessions.upsert({ key, cwd: key, status: 'active', continueId: null }) });
@@ -162,12 +167,12 @@ export function createMessageRouteStore(path: string): {
   };
 }
 
-/** 续跑卡 body:摘录进 expandable 引用块,前后空行分段(B1)。
+/** 续跑卡 body:成功摘录进 expandable 引用块；失败错误直接显示。
  *  body 前导 \n 是有意的 —— renderCard 只在 title 后放一个换行,这一个
  *  额外换行就是标题与正文之间的那道留白。 */
-export function buildContinueCardBody(lastMessage: string): string {
+export function buildContinueCardBody(lastMessage: string, failed = false): string {
   const ex = excerptForCard(lastMessage ?? '');
-  const quote = ex ? ex.split('\n').map((l) => `>! ${l}`).join('\n') + '\n\n' : '';
+  const quote = ex ? (failed ? `${ex}\n\n` : ex.split('\n').map((l) => `>! ${l}`).join('\n') + '\n\n') : '';
   // Quote-reply is the continue path (the on-card input box was removed) — the
   // hint spells it out because quote-reply is not obvious, esp. on Feishu.
   return `\n${quote}*Reply to this message to continue.*`;
@@ -772,8 +777,8 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
       // requestId 不进显示文本:回复路由走 replyToMessageId,不解析正文。
       const raw = req.context === TURN_FINISHED_SENTINEL ? '' : req.context;
       void sendToChat(t, {
-        title: 'Turn finished',
-        body: buildContinueCardBody(raw),
+        title: req.failed ? 'Turn failed' : 'Turn finished',
+        body: buildContinueCardBody(raw, req.failed),
         cwd: req.cwd,
         // No on-card input box: continuing a turn is done by quote-replying to
         // this card (inbound-handler routes a reply → the session's pending

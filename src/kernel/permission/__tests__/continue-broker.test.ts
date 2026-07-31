@@ -23,6 +23,16 @@ describe('ContinueBroker', () => {
     vi.useRealTimers();
   });
 
+  it('passes the failed marker to the card renderer', async () => {
+    const b = new ContinueBroker();
+    let captured: { requestId: string; failed?: boolean } | null = null;
+    b.onRequest((r) => { captured = r; });
+    const p = b.request({ cwd: '/r', context: '503', timeoutSec: 5, failed: true });
+    expect(captured?.failed).toBe(true);
+    b.answer(captured!.requestId, 'continue');
+    expect(await p).toBe('continue');
+  });
+
   it('answer on unknown requestId is a no-op', () => {
     const b = new ContinueBroker();
     expect(() => b.answer('nope', 'x')).not.toThrow();

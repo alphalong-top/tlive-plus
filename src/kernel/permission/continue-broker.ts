@@ -9,6 +9,7 @@ export interface ContinueRequest {
   requestId: string;
   cwd: string;
   context: string;
+  failed?: boolean;
 }
 
 export class ContinueBroker {
@@ -19,14 +20,14 @@ export class ContinueBroker {
     this.handler = h;
   }
 
-  request(opts: { cwd: string; context: string; timeoutSec: number }): Promise<string | null> {
+  request(opts: { cwd: string; context: string; timeoutSec: number; failed?: boolean }): Promise<string | null> {
     // One continuation per session. A new turn supersedes any older card for
     // the same session, so its timer must not later overwrite the new state.
     this.cancel(opts.cwd);
     const requestId = randomUUID();
     return new Promise<string | null>((resolve) => {
       this.pending.set(requestId, { cwd: opts.cwd, resolve });
-      this.handler?.({ requestId, cwd: opts.cwd, context: opts.context });
+      this.handler?.({ requestId, cwd: opts.cwd, context: opts.context, ...(opts.failed ? { failed: true } : {}) });
       setTimeout(() => {
         const entry = this.pending.get(requestId);
         if (entry) { this.pending.delete(requestId); entry.resolve(null); }

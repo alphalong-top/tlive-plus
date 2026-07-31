@@ -14,7 +14,7 @@ export interface CompanionDeps {
   connect: (events: CodexRpcEvents) => Promise<CodexRpc>;
   permissionRouter: Pick<PermissionRouter, 'requestPermission' | 'cancel'>;
   onMonitor: (ev: MonitorEvent, key: string) => void;
-  onResumePrompt: (p: { threadId: string; key: string; lastMessage?: string }) => void;
+  onResumePrompt: (p: { threadId: string; key: string; lastMessage?: string; error?: string }) => void;
   /** 远程审批窗口(秒),与 CC 共用 approvals.windowSec —— 消除"一家可配一家硬编码"的不对称。 */
   windowSec: () => number;
   log?: (msg: string) => void;
@@ -49,6 +49,10 @@ export function startCompanion(deps: CompanionDeps): Companion {
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   let pollTimer: ReturnType<typeof setInterval> | undefined;
   const lastMessages = new Map<string, string>();
+  // App-server normally emits `error` before `turn/completed`; keep one error
+  // and one notified turn per thread so either event order still yields one card.
+  const latestErrors = new Map<string, { turnId: string; message: string }>();
+  const notifiedFailures = new Map<string, string>();
   // Threads we've already (attempted to) resume on the current connection.
   // Cleared on disconnect — a reconnect doesn't preserve app-server subscriptions.
   let resumed = new Set<string>();
@@ -63,6 +67,23 @@ export function startCompanion(deps: CompanionDeps): Companion {
   const cwdOf = (threadId: string): string => threadCwds.get(threadId) ?? threadKey(threadId);
 
   const log = deps.log ?? (() => undefined);
+
+  function notifyTurnEnd(threadId: string, error?: string): void {
+    deps.permissionRouter.cancel({ key: threadKey(threadId) });
+    const key = threadKey(threadId);
+    const lastMessage = lastMessages.get(threadId);
+    deps.onMonitor(
+      error
+        ? { event: 'attention', cwd: cwdOf(threadId), sessionId: threadId, message: `Codex turn failed: ${error}` }
+        : { event: 'attention', cwd: cwdOf(threadId), sessionId: threadId, message: TURN_FINISHED_SENTINEL, ...(lastMessage !== undefined ? { lastMessage } : {}) },
+      key,
+    );
+    deps.onResumePrompt(
+      error
+        ? { threadId, key, error }
+        : { threadId, key, ...(lastMessage !== undefined ? { lastMessage } : {}) },
+    );
+  }
 
   type ResumeResult = {
     cwd?: unknown;
@@ -145,6 +166,20 @@ export function startCompanion(deps: CompanionDeps): Companion {
 
   function handleNotify(method: string, params: unknown): void {
     const p = (params ?? {}) as Record<string, unknown>;
+    if (method === 'error') {
+      const threadId = (p.threadId as string | undefined) ?? '';
+      const turnId = (p.turnId as string | undefined) ?? '';
+      if (!threadId) return;
+      const message = readTurnError(p.error) ?? 'Unknown Codex error';
+      if (turnId) latestErrors.set(threadId, { turnId, message });
+      // Intermediate provider failures are retried by Codex itself. Surface
+      // only the terminal outcome so a temporary 503 does not create noise.
+      if (p.willRetry === true) return;
+      if (turnId && notifiedFailures.get(threadId) === turnId) return;
+      if (turnId) notifiedFailures.set(threadId, turnId);
+      notifyTurnEnd(threadId, message);
+      return;
+    }
     if (method === 'thread/started') {
       const threadId = readThreadId(p);
       if (threadId) resumeThread(threadId);
@@ -190,14 +225,20 @@ export function startCompanion(deps: CompanionDeps): Companion {
     if (method === 'turn/completed') {
       const threadId = (p.threadId as string | undefined) ?? '';
       if (threadId) {
-        deps.permissionRouter.cancel({ key: threadKey(threadId) });
-        const key = threadKey(threadId);
-        const lastMessage = lastMessages.get(threadId);
-        deps.onMonitor(
-          { event: 'attention', cwd: cwdOf(threadId), sessionId: threadId, message: TURN_FINISHED_SENTINEL, ...(lastMessage !== undefined ? { lastMessage } : {}) },
-          key,
-        );
-        deps.onResumePrompt({ threadId, key, ...(lastMessage !== undefined ? { lastMessage } : {}) });
+        const turn = (p.turn ?? {}) as Record<string, unknown>;
+        const turnId = (turn.id as string | undefined) ?? '';
+        if (turnId && notifiedFailures.get(threadId) === turnId) {
+          latestErrors.delete(threadId);
+          deps.permissionRouter.cancel({ key: threadKey(threadId) });
+          return;
+        }
+        const cached = latestErrors.get(threadId);
+        const error = turn.status === 'failed'
+          ? readTurnError(turn.error) ?? (cached && (!turnId || cached.turnId === turnId) ? cached.message : undefined) ?? 'Unknown Codex error'
+          : undefined;
+        latestErrors.delete(threadId);
+        if (error && turnId) notifiedFailures.set(threadId, turnId);
+        notifyTurnEnd(threadId, error);
       }
       return;
     }
@@ -214,6 +255,8 @@ export function startCompanion(deps: CompanionDeps): Companion {
         const key = threadKey(threadId);
         const cwd = cwdOf(threadId);
         lastMessages.delete(threadId);
+        latestErrors.delete(threadId);
+        notifiedFailures.delete(threadId);
         deps.onMonitor({ event: 'session-end', cwd, sessionId: threadId }, key);
         // Thread is done — drop the cached cwd so it can't leak into a stray
         // later event for the same (now-archived) threadId.
@@ -335,6 +378,19 @@ export function startCompanion(deps: CompanionDeps): Companion {
       }
     },
   };
+}
+
+function readTurnError(value: unknown): string | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const error = value as Record<string, unknown>;
+  const message = typeof error.message === 'string' ? error.message.trim() : '';
+  const details = typeof error.additionalDetails === 'string' ? error.additionalDetails.trim() : '';
+  if (message && details && !message.includes(details) && !details.includes(message)) return `${message}\n${details}`;
+  if (message && details) return message.length >= details.length ? message : details;
+  if (message || details) return message || details;
+  if (typeof error.codexErrorInfo === 'string') return error.codexErrorInfo;
+  if (error.codexErrorInfo && typeof error.codexErrorInfo === 'object') return JSON.stringify(error.codexErrorInfo);
+  return undefined;
 }
 
 function readThreadId(p: Record<string, unknown>): string | undefined {

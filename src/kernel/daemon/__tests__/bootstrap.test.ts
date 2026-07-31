@@ -1048,6 +1048,38 @@ describe('Codex resume handler → continue card (regression: sentinel mismatch)
     expect(card.title?.endsWith('Turn finished')).toBe(true);
     expect(card.body).toBe('\n*Reply to this message to continue.*');
   });
+
+  it('renders a failed turn with the error visible and keeps quote-reply continuation', async () => {
+    writeFileSync(join(tmp, 'config.json'), JSON.stringify({
+      web: { enabled: false },
+      adapters: { telegram: { token: 't', chatIdAllowList: ['c1'] } },
+    }));
+    const sent: OutgoingMessage[] = [];
+    h = await bootstrapDaemon({ home: tmp, imAdapters: [recordingAdapter('telegram', sent)] });
+    const onCodexResumePrompt = makeCodexResumeHandler({
+      broker: h.continueBroker,
+      sessions: h.sessions,
+      events: h.events,
+      chats: () => [{}],
+      resume: async () => undefined,
+      continueWindowSec: () => 1800,
+    });
+
+    onCodexResumePrompt({
+      threadId: 't1',
+      key: 'codex:t1',
+      error: 'unexpected status 503 Service Unavailable\nSelected model is at capacity.',
+    });
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+
+    expect(sent).toHaveLength(1);
+    const card = sent[0] as { kind: 'card'; title?: string; body?: string };
+    expect(card.title?.endsWith('Turn failed')).toBe(true);
+    expect(card.body).toContain('unexpected status 503 Service Unavailable');
+    expect(card.body).toContain('Selected model is at capacity.');
+    expect(card.body).toContain('Reply to this message to continue.');
+    expect(card.body).not.toContain('>!');
+  });
 });
 
 // A sub-agent's request is handed straight back to CC so its terminal dialog

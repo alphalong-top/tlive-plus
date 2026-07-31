@@ -15,6 +15,12 @@ describe('buildContinueCardBody', () => {
     expect(buildContinueCardBody('')).toBe('\n*Reply to this message to continue.*');
   });
 
+  it('shows a failed turn error directly while keeping the continue action', () => {
+    expect(buildContinueCardBody('503 Service Unavailable\nModel at capacity', true)).toBe(
+      '\n503 Service Unavailable\nModel at capacity\n\n*Reply to this message to continue.*',
+    );
+  });
+
   it('runs the excerpt pipeline (headings become bold, code blocks survive)', () => {
     const body = buildContinueCardBody('## T\n\n```\nls\n```');
     expect(body).toContain('>! **T**');

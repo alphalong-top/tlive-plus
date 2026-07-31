@@ -27,4 +27,30 @@ describe('ContinueBroker', () => {
     const b = new ContinueBroker();
     expect(() => b.answer('nope', 'x')).not.toThrow();
   });
+
+  it('a newer request cancels the older request for the same session', async () => {
+    const b = new ContinueBroker();
+    const ids: string[] = [];
+    b.onRequest((r) => ids.push(r.requestId));
+    const old = b.request({ cwd: '/r', context: 'old', timeoutSec: 5 });
+    const current = b.request({ cwd: '/r', context: 'current', timeoutSec: 5 });
+    expect(await old).toBeNull();
+    expect(b.hasPending('/r')).toBe(true);
+    b.answer(ids[1], 'continue');
+    expect(await current).toBe('continue');
+  });
+
+  it('cancelling one session leaves another session pending', async () => {
+    const b = new ContinueBroker();
+    const ids = new Map<string, string>();
+    b.onRequest((r) => ids.set(r.cwd, r.requestId));
+    const cancelled = b.request({ cwd: '/a', context: 'a', timeoutSec: 5 });
+    const untouched = b.request({ cwd: '/b', context: 'b', timeoutSec: 5 });
+    expect(b.cancel('/a')).toBe(true);
+    expect(await cancelled).toBeNull();
+    expect(b.hasPending('/a')).toBe(false);
+    expect(b.hasPending('/b')).toBe(true);
+    b.answer(ids.get('/b')!, 'go');
+    expect(await untouched).toBe('go');
+  });
 });

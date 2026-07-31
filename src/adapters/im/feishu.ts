@@ -182,7 +182,7 @@ export class FeishuAdapter implements IMAdapter {
         // requestHandle.parse; the wrapped read crashed every inbound text with
         // "Cannot read properties of undefined (reading 'message')" — feishu
         // inbound had never actually worked). Tolerate both shapes anyway.
-        type FeishuMsgEvent = { sender: { sender_id: { user_id: string } }; message: { message_id: string; chat_id: string; content: string; create_time: string; message_type?: string; parent_id?: string; root_id?: string } };
+        type FeishuMsgEvent = { sender: { sender_id: { open_id?: string; user_id?: string } }; message: { message_id: string; chat_id: string; content: string; create_time: string; message_type?: string; parent_id?: string; root_id?: string } };
         const raw = data as FeishuMsgEvent & { event?: FeishuMsgEvent };
         const ev = raw.message ? raw : raw.event;
         if (!ev?.message) return;
@@ -209,7 +209,7 @@ export class FeishuAdapter implements IMAdapter {
         this.inboundHandler({
           channel: 'feishu',
           chatId: ev.message.chat_id,
-          userId: ev.sender.sender_id.user_id,
+          userId: ev.sender.sender_id.open_id ?? ev.sender.sender_id.user_id ?? '',
           messageId: ev.message.message_id,
           text,
           ...(attachments ? { attachments } : {}),
@@ -238,7 +238,7 @@ export class FeishuAdapter implements IMAdapter {
           this.inboundHandler({
             channel: 'feishu',
             chatId,
-            userId: d.operator?.user_id ?? d.operator?.open_id ?? '',
+            userId: d.operator?.open_id ?? d.operator?.user_id ?? '',
             messageId: d.context?.open_message_id ?? '',
             text: val,
             ...(typed ? { formText: typed } : {}),

@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { bootstrapDaemon, shouldFastNullContinue, clampPermissionTimeout, makeCodexResumeHandler, shouldDropNotify, resolveKey, type DaemonHandle } from '../bootstrap';
+import { bootstrapDaemon, shouldFastNullContinue, clampPermissionTimeout, createMessageRouteStore, makeCodexResumeHandler, shouldDropNotify, resolveKey, type DaemonHandle } from '../bootstrap';
 import { request, daemonSocketPath } from '../../ipc/client';
 import type { IMAdapter, IMChannel, OutgoingMessage, IncomingEnvelope } from '../../contracts/im-adapter';
 import { SessionRegistry } from '../../web/session-registry';
@@ -78,6 +78,15 @@ describe('resolveKey — one key per session, not per directory', () => {
   });
 });
 
+describe('persistent message routes', () => {
+  it('survives daemon recreation without storing anything beyond opaque ids', () => {
+    const path = join(tmp, 'message-routes.json');
+    createMessageRouteStore(path).remember('feishu', 'message-1', 'codex:thread-1');
+    expect(createMessageRouteStore(path).get('feishu', 'message-1')).toBe('codex:thread-1');
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+  });
+});
+
 describe('shouldDropNotify', () => {
   it('drops an info-level idle notify when a continue card is already pending for the session', () => {
     expect(shouldDropNotify('req-1', 'info')).toBe(true);
@@ -106,11 +115,12 @@ describe('makeCodexResumeHandler', () => {
     const resume = async (_t: string, _i: string) => undefined;
     let resumeCall: [string, string] | undefined;
     const handler = makeCodexResumeHandler({
-      broker: { request: async () => 'go on' },
+      broker: { request: async () => 'go on', hasPending: () => false },
       sessions,
       events,
       chats: () => [],
       resume: async (t, i) => { resumeCall = [t, i]; await resume(t, i); },
+      continueWindowSec: () => 1800,
     });
     handler({ threadId: 't1', key: 'codex:t1', lastMessage: 'done' });
     await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
@@ -124,11 +134,12 @@ describe('makeCodexResumeHandler', () => {
     let requested = false;
     let resumed = false;
     const handler = makeCodexResumeHandler({
-      broker: { request: async () => { requested = true; return 'x'; } },
+      broker: { request: async () => { requested = true; return 'x'; }, hasPending: () => false },
       sessions,
       events,
       chats: () => [],
       resume: async () => { resumed = true; },
+      continueWindowSec: () => 1800,
     });
     handler({ threadId: 't1', key: 'codex:t1' });
     await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
@@ -142,16 +153,34 @@ describe('makeCodexResumeHandler', () => {
     const events = fakeEvents(1);
     let resumed = false;
     const handler = makeCodexResumeHandler({
-      broker: { request: async () => null },
+      broker: { request: async () => null, hasPending: () => false },
       sessions,
       events,
       chats: () => [],
       resume: async () => { resumed = true; },
+      continueWindowSec: () => 1800,
     });
     handler({ threadId: 't1', key: 'codex:t1' });
     await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
     expect(resumed).toBe(false);
     expect(events.broadcasts.filter((b: any) => b.session?.status === 'idle').length).toBeGreaterThan(0);
+  });
+
+  it('uses the configured continue window instead of the old 170-second constant', async () => {
+    const sessions = new SessionRegistry();
+    const events = fakeEvents(1);
+    const request = vi.fn(async () => null);
+    const handler = makeCodexResumeHandler({
+      broker: { request, hasPending: () => false },
+      sessions,
+      events,
+      chats: () => [{}],
+      resume: async () => undefined,
+      continueWindowSec: () => 7200,
+    });
+    handler({ threadId: 't1', key: 'codex:t1' });
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    expect(request).toHaveBeenCalledWith(expect.objectContaining({ timeoutSec: 7200 }));
   });
 });
 
@@ -1006,6 +1035,7 @@ describe('Codex resume handler → continue card (regression: sentinel mismatch)
       events: h.events,
       chats: () => [{}], // non-empty → bypasses the fast-null path
       resume: async () => undefined,
+      continueWindowSec: () => 1800,
     });
 
     onCodexResumePrompt({ threadId: 't1', key: 'codex:t1' }); // no lastMessage

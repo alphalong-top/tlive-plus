@@ -1,7 +1,7 @@
 // src/kernel/daemon/bootstrap.ts
 import { join, dirname } from 'node:path';
 import { spawn as spawnChild } from 'node:child_process';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { startIpcServer, type IpcServer } from '../ipc/server.js';
 import { daemonSocketPath } from '../ipc/client.js';
@@ -73,11 +73,12 @@ export function shouldDropNotify(continueId: string | null | undefined, level: '
  *  broadcast, so this only needs the session-upsert bookkeeping. Never throws
  *  — the companion notify path must not crash on a broker/resume failure. */
 export function makeCodexResumeHandler(deps: {
-  broker: Pick<ContinueBroker, 'request'>;
+  broker: Pick<ContinueBroker, 'request' | 'hasPending'>;
   sessions: SessionRegistry;
   events: Pick<EventHub, 'broadcast' | 'size'>;
   chats: () => unknown[];
   resume: (threadId: string, input: string) => Promise<void>;
+  continueWindowSec: () => number;
 }): (p: { threadId: string; key: string; lastMessage?: string }) => void {
   return (p) => {
     void (async () => {
@@ -93,11 +94,11 @@ export function makeCodexResumeHandler(deps: {
         type: 'session-upsert',
         session: deps.sessions.upsert({ key, cwd: key, status: 'waiting-input', ...(lastMessage ? { lastMessage } : {}) }),
       });
-      const reply = await deps.broker.request({ cwd: key, context: lastMessage ?? TURN_FINISHED_SENTINEL, timeoutSec: 170 });
+      const reply = await deps.broker.request({ cwd: key, context: lastMessage ?? TURN_FINISHED_SENTINEL, timeoutSec: deps.continueWindowSec() });
       if (reply) {
         deps.resume(threadId, reply).catch((e) => console.log('[codex] resume failed: ' + (e instanceof Error ? e.message : String(e))));
         deps.events.broadcast({ type: 'session-upsert', session: deps.sessions.upsert({ key, cwd: key, status: 'active', continueId: null }) });
-      } else {
+      } else if (deps.sessions.get(key)?.status === 'waiting-input' && !deps.broker.hasPending(key)) {
         deps.events.broadcast({ type: 'session-upsert', session: deps.sessions.upsert({ key, cwd: key, status: 'idle', continueId: null }) });
       }
     })().catch(() => undefined);
@@ -123,6 +124,43 @@ export const resolveKey = (sessionId: string, cwd: string, wrappedId?: string): 
  *  了才是产品在撒谎。覆盖:daemon 重启 / 已超时 / 会话已结束。 */
 export const STALE_CARD_NOTICE =
   'This request is no longer active — the session ended, timed out, or tlive restarted. Answer at the keyboard.';
+
+const MESSAGE_ROUTE_LIMIT = 500;
+
+/** Persistent IM message → session routing. Only opaque ids are stored; no
+ *  prompts, card bodies or credentials enter this file. */
+export function createMessageRouteStore(path: string): {
+  get(channel: string, messageId: string): string | undefined;
+  remember(channel: string, messageId: string, key: string): void;
+} {
+  let entries: Array<[string, string]> = [];
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8')) as unknown;
+    if (Array.isArray(parsed)) {
+      entries = parsed.filter((v): v is [string, string] =>
+        Array.isArray(v) && v.length === 2 && typeof v[0] === 'string' && typeof v[1] === 'string',
+      ).slice(-MESSAGE_ROUTE_LIMIT);
+    }
+  } catch { /* first start or a damaged cache: rebuild from new messages */ }
+  const routes = new Map(entries);
+  return {
+    get: (channel, messageId) => routes.get(`${channel}:${messageId}`),
+    remember(channel, messageId, key): void {
+      if (!messageId) return;
+      const route = `${channel}:${messageId}`;
+      if (routes.has(route)) routes.delete(route);
+      while (routes.size >= MESSAGE_ROUTE_LIMIT) {
+        const oldest = routes.keys().next().value;
+        if (oldest === undefined) break;
+        routes.delete(oldest);
+      }
+      routes.set(route, key);
+      const tmp = `${path}.${process.pid}.tmp`;
+      writeFileSync(tmp, JSON.stringify([...routes]), { mode: 0o600 });
+      renameSync(tmp, path);
+    },
+  };
+}
 
 /** 续跑卡 body:摘录进 expandable 引用块,前后空行分段(B1)。
  *  body 前导 \n 是有意的 —— renderCard 只在 title 后放一个换行,这一个
@@ -183,14 +221,12 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
   const sessions = new SessionRegistry();
   const events = new EventHub();
 
-  // IM messageId → registry key, for reply-to routing (bounded; daemon-lifetime only).
-  const msgToKey = new Map<string, string>();
+  // IM messageId → registry key. Persisted so quote-replies to old Codex cards
+  // still recover the exact thread after a daemon restart.
+  const messageRoutes = createMessageRouteStore(join(opts.home, 'message-routes.json'));
   const rememberMsg = (channel: string, messageId: string, key: string): void => {
-    if (msgToKey.size >= 500) {
-      const oldest = msgToKey.keys().next().value;
-      if (oldest !== undefined) msgToKey.delete(oldest);
-    }
-    msgToKey.set(`${channel}:${messageId}`, key);
+    try { messageRoutes.remember(channel, messageId, key); }
+    catch { logJson('message-route.persist-failed', { channel }); }
   };
 
   // Approval cards sent per requestId — edited to their outcome on resolve (no
@@ -717,13 +753,13 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
   });
 
   const continueBroker = new ContinueBroker();
-  let latestContinueId: string | null = null;
+  const continueWindowSec = (): number =>
+    Math.min(Math.max(cfg.approvals?.continueWindowSec ?? 1800, 30), 86_400);
   // key → cancel-grace:一个会话在续跑 grace 窗口内时,收到该会话的新 prompt
   // 就调用它取消发卡(用户在键盘前继续了)。
   const continueGrace = new Map<string, () => void>();
 
   continueBroker.onRequest((req) => {
-    latestContinueId = req.requestId;
     // Thread the continue requestId into the session so a dashboard client can reply to it.
     events.broadcast({ type: 'session-upsert', session: sessions.upsert({ key: req.cwd, cwd: req.cwd, status: 'waiting-input', continueId: req.requestId }) });
     if (muted || sessions.get(req.cwd)?.muted) return;
@@ -759,20 +795,29 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
   }).catch(() => null);
   // Indirection: onResumePrompt is needed at construction time, but resume()
   // only exists once startCompanion returns — close over this instead.
-  let codexResume: (threadId: string, input: string) => Promise<void> = async () => undefined;
+  let codexResume: (threadId: string, input: string) => Promise<void> = async () => {
+    throw new Error('Codex app-server is unavailable');
+  };
   const onCodexResumePrompt = makeCodexResumeHandler({
     broker: continueBroker,
     sessions,
     events,
     chats: configuredChats,
     resume: (threadId, input) => codexResume(threadId, input),
+    continueWindowSec,
   });
   if (custody) {
     codexState = 'running';
     codexCompanion = startCompanion({
       connect: (events) => connectCodexRpc({ sockPath: codexAppServerSockPath(), events }),
       permissionRouter,
-      onMonitor: (ev, key) => events.broadcast(applyMonitorEvent(sessions, ev, key)),
+      onMonitor: (ev, key) => {
+        if (ev.event === 'prompt') {
+          sessions.upsert({ key, cwd: ev.cwd, continueId: null });
+          continueBroker.cancel(key);
+        }
+        events.broadcast(applyMonitorEvent(sessions, ev, key));
+      },
       onResumePrompt: onCodexResumePrompt,
       windowSec: () => approvalWindow(cfg.approvals).timeoutSec,
       log: (m) => console.log(`[codex] ${m}`),
@@ -982,10 +1027,14 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
           events.broadcast({ type: 'session-upsert', session: sessions.upsert({ key, cwd: req.cwd, status: 'waiting-input', ...(req.lastMessage ? { lastMessage: req.lastMessage } : {}) }) });
           // IM 摘录用真正的最后一句;没有才落回通用 context 文案。async Stop hook
           // 在后台等,窗口可以很长(默认 30min),覆盖"离开很久才看手机"。
-          const continueWin = Math.min(Math.max(cfg.approvals?.continueWindowSec ?? 1800, 30), 86_400);
-          const reply_text = await continueBroker.request({ cwd: key, context: req.lastMessage ?? req.context, timeoutSec: continueWin });
-          // Resolved (replied or timed out): clear the reply target; back to active if continuing, else idle.
-          events.broadcast({ type: 'session-upsert', session: sessions.upsert({ key, cwd: req.cwd, status: reply_text ? 'active' : 'idle', continueId: null }) });
+          const reply_text = await continueBroker.request({ cwd: key, context: req.lastMessage ?? req.context, timeoutSec: continueWindowSec() });
+          // A newer prompt/request may have cancelled this wait. Only the still-current
+          // request may clear the reply target or move the session back to idle.
+          if (reply_text) {
+            events.broadcast({ type: 'session-upsert', session: sessions.upsert({ key, cwd: req.cwd, status: 'active', continueId: null }) });
+          } else if (sessions.get(key)?.status === 'waiting-input' && !continueBroker.hasPending(key)) {
+            events.broadcast({ type: 'session-upsert', session: sessions.upsert({ key, cwd: req.cwd, status: 'idle', continueId: null }) });
+          }
           reply({ kind: 'hook.continue.result', reply: reply_text });
           return;
         }
@@ -1139,6 +1188,8 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
             // (它仍真在等,且无本地答路 —— 清掉 = 保证被 deny),不得被父 prompt 清场。
             permissionRouter.cancel({ key, sessionId: ev.sessionId, matchAgent: null });
             clearLocalPrompt(key, ev.sessionId, ev.cwd);
+            sessions.upsert({ key, cwd: ev.cwd, continueId: null });
+            continueBroker.cancel(key);
             // 用户在键盘前开始了新一轮 → 取消上一 turn 还在 grace 里的续跑卡
             const g = continueGrace.get(key);
             if (g) { continueGrace.delete(key); g(); }
@@ -1187,7 +1238,6 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
     imBy: (ch) => (opts.imAdapters ?? []).find((a) => a.channel === ch),
     permissionRouter,
     continueBroker,
-    takeLatestContinueId: () => { const id = latestContinueId; latestContinueId = null; return id; },
     setMuted: (m: boolean) => runtimeSet('mute', m),
     setTrust: (t: boolean) => runtimeSet('trust', t),
     getMode: () => currentMode(),
@@ -1197,14 +1247,29 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
     addAllowTool: (tool: string) => { policyState.allowTools?.add(tool); },
     askFlow,
     repaintAsk,
-    resolveReply: (channel, messageId) => msgToKey.get(`${channel}:${messageId}`),
-    sessionInfo: (cwd) => {
-      const s = sessions.get(cwd);
-      if (!s) return undefined;
-      return { kind: s.kind, label: s.label, ...(s.sockPath ? { sockPath: s.sockPath } : {}), ...(s.continueId ? { continueId: s.continueId } : {}) };
+    resolveReply: (channel, messageId) => messageRoutes.get(channel, messageId),
+    sessionInfo: (key) => {
+      const s = sessions.get(key);
+      const codexThreadId = key.startsWith('codex:') ? key.slice('codex:'.length) : undefined;
+      if (!s) return codexThreadId ? { kind: 'hook' as const, label: 'Codex', codexThreadId } : undefined;
+      return {
+        kind: s.kind,
+        label: s.label,
+        ...(s.sockPath ? { sockPath: s.sockPath } : {}),
+        ...(s.continueId ? { continueId: s.continueId } : {}),
+        ...(codexThreadId ? { codexThreadId } : {}),
+      };
     },
-    listSessions: () => sessions.list().map((s) => ({ cwd: s.cwd, kind: s.kind, label: s.label, ...(s.sockPath ? { sockPath: s.sockPath } : {}) })),
+    listSessions: () => sessions.list().map((s) => ({
+      cwd: s.cwd,
+      kind: s.kind,
+      label: s.label,
+      ...(s.sockPath ? { sockPath: s.sockPath } : {}),
+      ...(s.continueId ? { continueId: s.continueId } : {}),
+      ...(s.id.startsWith('codex:') ? { codexThreadId: s.id.slice('codex:'.length) } : {}),
+    })),
     inject: (sockPath, text) => injectInput(sockPath, text),
+    sendCodex: (threadId, text) => codexResume(threadId, text),
     findLiveCard,
   });
   for (const a of opts.imAdapters ?? []) {

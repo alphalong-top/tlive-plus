@@ -31,12 +31,16 @@ describe('companion', () => {
   afterEach(() => { vi.useRealTimers(); });
 
   it('on connect lists and resumes threads', async () => {
-    const { calls, comp } = harness();
+    const { calls, comp, onMonitor } = harness();
     await vi.runOnlyPendingTimersAsync();
     await Promise.resolve();
     await Promise.resolve();
     expect(calls.some((c) => c.method === 'thread/loaded/list')).toBe(true);
     expect(calls.some((c) => c.method === 'thread/resume' && c.params.threadId === 't1')).toBe(true);
+    expect(onMonitor).toHaveBeenCalledWith(
+      { event: 'session-start', cwd: 'codex:t1', sessionId: 't1' },
+      'codex:t1',
+    );
     comp.stop();
   });
 
@@ -292,6 +296,26 @@ describe('companion', () => {
     await comp.resume('t1', 'fix tests');
     expect(calls.some((c) => c.method === 'turn/start' && c.params.threadId === 't1'
       && Array.isArray(c.params.input) && c.params.input[0].text === 'fix tests')).toBe(true);
+    comp.stop();
+  });
+
+  it('resume() steers the active turn instead of starting a conflicting turn', async () => {
+    const { comp, rpc } = harness();
+    await vi.runOnlyPendingTimersAsync();
+    await Promise.resolve();
+    await Promise.resolve();
+    rpc.call.mockImplementation(async (method: string, params: any) => {
+      if (method === 'thread/resume') {
+        return { thread: { id: params.threadId, turns: [{ id: 'turn-active', status: 'inProgress' }] }, cwd: '/repo' };
+      }
+      return {};
+    });
+    await comp.resume('t1', 'focus on the failing test');
+    expect(rpc.call).toHaveBeenCalledWith('turn/steer', {
+      threadId: 't1',
+      input: [{ type: 'text', text: 'focus on the failing test' }],
+      expectedTurnId: 'turn-active',
+    });
     comp.stop();
   });
 

@@ -74,6 +74,13 @@ describe('FeishuAdapter', () => {
       expect(inbound.mock.calls[0][0]).toMatchObject({ chatId: 'chat-ok', text: 'hello' });
     });
 
+    it('uses open_id when Feishu omits user_id', async () => {
+      const msg = makeMsg('chat-ok');
+      (msg.sender as Record<string, unknown>).sender_id = { open_id: 'open-user-1' };
+      await capturedHandlers['im.message.receive_v1'](msg);
+      expect(inbound.mock.calls[0][0]).toMatchObject({ userId: 'open-user-1' });
+    });
+
     it('carries parent_id through as replyToMessageId (quote-reply routing)', async () => {
       const msg = makeMsg('chat-ok');
       (msg.message as Record<string, unknown>).parent_id = 'om_parent';
@@ -127,6 +134,13 @@ describe('FeishuAdapter', () => {
       await capturedHandlers['card.action.trigger'](makeCallback('chat-ok', 'approve:abc'));
       expect(inbound).toHaveBeenCalledOnce();
       expect(inbound.mock.calls[0][0]).toMatchObject({ chatId: 'chat-ok', text: 'approve:abc' });
+    });
+
+    it('uses open_id consistently for callback allowlisting', async () => {
+      const callback = makeCallback('chat-ok', 'approve:abc');
+      callback.operator = { user_id: 'tenant-user', open_id: 'open-user-1' } as typeof callback.operator;
+      await capturedHandlers['card.action.trigger'](callback);
+      expect(inbound.mock.calls[0][0]).toMatchObject({ userId: 'open-user-1' });
     });
 
     it('still tolerates the legacy wrapped {event:{…}} shape', async () => {

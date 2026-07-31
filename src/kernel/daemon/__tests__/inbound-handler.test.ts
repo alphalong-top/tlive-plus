@@ -32,7 +32,6 @@ const baseDeps = (over: Partial<InboundHandlerDeps> = {}): InboundHandlerDeps =>
     imBy: () => undefined,
     permissionRouter: { answer: vi.fn(), requestPermission: vi.fn() } as unknown as PermissionRouter,
     continueBroker: { answer: vi.fn().mockReturnValue(false), request: vi.fn(), onRequest: vi.fn() } as unknown as ContinueBroker,
-    takeLatestContinueId: () => null,
     setMuted: vi.fn(),
     setTrust: vi.fn(),
     setAutoApprove: vi.fn(),
@@ -44,6 +43,7 @@ const baseDeps = (over: Partial<InboundHandlerDeps> = {}): InboundHandlerDeps =>
     sessionInfo: () => undefined,
     listSessions: () => [],
     inject: vi.fn().mockResolvedValue(undefined),
+    sendCodex: vi.fn().mockResolvedValue(undefined),
     findLiveCard: () => null,
     askFlow: new AskFlow(),
     repaintAsk: vi.fn(),
@@ -93,7 +93,7 @@ describe('InboundHandler', () => {
     const h = new InboundHandler(baseDeps({
       imBy: () => makeAdapter(msgs),
       continueBroker: { answer: brokerAnswer, request: vi.fn(), onRequest: vi.fn() } as unknown as ContinueBroker,
-      takeLatestContinueId: () => 'stale-id',
+      listSessions: () => [{ cwd: '/repo', kind: 'hook' as const, label: 'repo', continueId: 'stale-id' }],
     }));
     await h.handle(envelope({ text: 'free text' }));
     expect(brokerAnswer).toHaveBeenCalledWith('stale-id', 'free text');
@@ -101,17 +101,17 @@ describe('InboundHandler', () => {
     expect((msgs[0] as { text: string }).text).toContain('tlive');
   });
 
-  it('live continueId consumed without help', async () => {
+  it('live continueId is consumed with an acknowledgement, not help', async () => {
     const brokerAnswer = vi.fn().mockReturnValue(true);
     const msgs: Array<{ kind: string; text?: string }> = [];
     const h = new InboundHandler(baseDeps({
       imBy: () => makeAdapter(msgs),
       continueBroker: { answer: brokerAnswer, request: vi.fn(), onRequest: vi.fn() } as unknown as ContinueBroker,
-      takeLatestContinueId: () => 'live-id',
+      listSessions: () => [{ cwd: '/repo', kind: 'hook' as const, label: 'repo', continueId: 'live-id' }],
     }));
     await h.handle(envelope({ text: 'run tests' }));
     expect(brokerAnswer).toHaveBeenCalledWith('live-id', 'run tests');
-    expect(msgs).toHaveLength(0);
+    expect(msgs).toEqual([expect.objectContaining({ text: 'Sent to [repo]' })]);
   });
 
   it('/help renders a styled card (inline-code command chips), not bare text, and never lists the retired /desktop', async () => {
@@ -454,7 +454,9 @@ describe('reply-to routing & injection', () => {
   it('quoted reply prefers a live continue over injection', async () => {
     const inject = vi.fn();
     const answer = vi.fn().mockReturnValue(true);
+    const msgs: Array<{ kind: string; text?: string }> = [];
     const h = new InboundHandler(baseDeps({
+      imBy: () => makeAdapter(msgs),
       resolveReply: () => '/repo',
       sessionInfo: () => ({ kind: 'wrapped' as const, label: 'l', sockPath: '/s.sock', continueId: 'c9' }),
       continueBroker: { answer, request: vi.fn(), onRequest: vi.fn() } as never,
@@ -463,6 +465,7 @@ describe('reply-to routing & injection', () => {
     await h.handle(envelope({ text: 'go on', replyToMessageId: 'q1' }));
     expect(answer).toHaveBeenCalledWith('c9', 'go on');
     expect(inject).not.toHaveBeenCalled();
+    expect(msgs).toEqual([expect.objectContaining({ text: 'Sent to [l]' })]);
   });
 
   it('quoted reply to a hook-only session explains injection is unavailable', async () => {
@@ -474,6 +477,61 @@ describe('reply-to routing & injection', () => {
     }));
     await h.handle(envelope({ text: 'hello', replyToMessageId: 'q1' }));
     expect(msgs.some((m) => m.text?.includes('无法注入'))).toBe(true);
+  });
+
+  it('quoted reply to a persisted Codex route resumes that exact thread even without a live session record', async () => {
+    const sendCodex = vi.fn().mockResolvedValue(undefined);
+    const msgs: Array<{ kind: string; text?: string }> = [];
+    const h = new InboundHandler(baseDeps({
+      imBy: () => makeAdapter(msgs),
+      resolveReply: () => 'codex:thread-old',
+      sessionInfo: () => ({ kind: 'hook' as const, label: 'Codex', codexThreadId: 'thread-old' }),
+      sendCodex,
+    }));
+    await h.handle(envelope({ text: '继续之前的任务', replyToMessageId: 'old-card' }));
+    expect(sendCodex).toHaveBeenCalledWith('thread-old', '继续之前的任务');
+    expect(msgs.some((m) => m.text?.includes('Sent to'))).toBe(true);
+  });
+
+  it('bare text routes to the only active Codex thread', async () => {
+    const sendCodex = vi.fn().mockResolvedValue(undefined);
+    const h = new InboundHandler(baseDeps({
+      imBy: () => makeAdapter([]),
+      listSessions: () => [{ cwd: '/repo', kind: 'hook' as const, label: 'repo', codexThreadId: 'thread-1' }],
+      sendCodex,
+    }));
+    await h.handle(envelope({ text: 'run tests' }));
+    expect(sendCodex).toHaveBeenCalledWith('thread-1', 'run tests');
+  });
+
+  it('bare text never guesses when both a Codex and wrapped session can receive it', async () => {
+    const sendCodex = vi.fn();
+    const inject = vi.fn();
+    const msgs: Array<{ kind: string; text?: string }> = [];
+    const h = new InboundHandler(baseDeps({
+      imBy: () => makeAdapter(msgs),
+      listSessions: () => [
+        { cwd: '/a', kind: 'hook' as const, label: 'codex', codexThreadId: 'thread-1' },
+        { cwd: '/b', kind: 'wrapped' as const, label: 'wrapped', sockPath: '/b.sock' },
+      ],
+      sendCodex,
+      inject,
+    }));
+    await h.handle(envelope({ text: 'do it' }));
+    expect(sendCodex).not.toHaveBeenCalled();
+    expect(inject).not.toHaveBeenCalled();
+    expect(msgs.some((m) => m.text?.includes('引用'))).toBe(true);
+  });
+
+  it('reports Codex resume failures instead of silently dropping the message', async () => {
+    const msgs: Array<{ kind: string; text?: string }> = [];
+    const h = new InboundHandler(baseDeps({
+      imBy: () => makeAdapter(msgs),
+      listSessions: () => [{ cwd: '/repo', kind: 'hook' as const, label: 'repo', codexThreadId: 'thread-1' }],
+      sendCodex: vi.fn().mockRejectedValue(new Error('thread not found')),
+    }));
+    await h.handle(envelope({ text: 'retry' }));
+    expect(msgs.some((m) => m.text?.includes('发送失败') && m.text.includes('thread not found'))).toBe(true);
   });
 
   it('bare text with exactly one wrapped session injects directly', async () => {

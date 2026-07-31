@@ -18,8 +18,6 @@ export interface InboundHandlerDeps {
   imBy: (channel: 'telegram' | 'feishu') => IMAdapter | undefined;
   permissionRouter: PermissionRouter;
   continueBroker: ContinueBroker;
-  /** Returns + clears the most-recent pending continue requestId (single-chat). */
-  takeLatestContinueId: () => string | null;
   /** Toggle IM notification mute (`/mute on|off`; on = muted). IM only —
    *  desktop toasts have their own switch. */
   setMuted: (muted: boolean) => void;
@@ -51,14 +49,16 @@ export interface InboundHandlerDeps {
    *  because both surfaces must move together: the daemon holds the cursor, so
    *  answering a question here has to advance the dashboard too. */
   repaintAsk: (requestId: string) => void;
-  /** Reply-to routing: IM messageId → session cwd (daemon-lifetime map). */
+  /** Reply-to routing: IM messageId → session key (persisted by the daemon). */
   resolveReply: (channel: string, messageId: string) => string | undefined;
-  /** Session lookup for injection routing. */
-  sessionInfo: (cwd: string) => { kind: 'wrapped' | 'hook'; label: string; sockPath?: string; continueId?: string } | undefined;
+  /** Session lookup for exact quote-reply routing. */
+  sessionInfo: (key: string) => { kind: 'wrapped' | 'hook'; label: string; sockPath?: string; continueId?: string; codexThreadId?: string } | undefined;
   /** All current sessions (for bare-text single-session routing). */
-  listSessions: () => Array<{ cwd: string; kind: 'wrapped' | 'hook'; label: string; sockPath?: string }>;
+  listSessions: () => Array<{ cwd: string; kind: 'wrapped' | 'hook'; label: string; sockPath?: string; continueId?: string; codexThreadId?: string }>;
   /** Inject text into a wrapped session's pty (bracketed paste + Enter). */
   inject: (sockPath: string, text: string) => Promise<void>;
+  /** Reopen a Codex app-server thread, then start or steer its turn. */
+  sendCodex: (threadId: string, text: string) => Promise<void>;
   /** IM messageId → still-live approval requestId, or null if that card has
    *  already settled (or was never a card). Backed by bootstrap.ts's sentCards,
    *  which is deleted the instant a request resolves — "findable" IS "live",
@@ -258,26 +258,23 @@ export class InboundHandler {
       return;
     }
 
-    const continueId = env.text ? this.deps.takeLatestContinueId() : null;
-    if (continueId) {
-      const hit = this.deps.continueBroker.answer(continueId, env.text);
-      if (hit) return;
+    // Bare text is safe only when exactly one session can receive it. A global
+    // "latest continue" silently targeted the wrong project when two Codex
+    // threads finished close together.
+    const targets = this.deps.listSessions().filter((s) =>
+      Boolean(s.continueId || (s.kind === 'wrapped' && s.sockPath) || s.codexThreadId),
+    );
+    if (targets.length === 1) {
+      if (await this.routeSession(env, targets[0])) return;
     }
-
-    // Bare text: with exactly ONE wrapped session, inject directly; more → ask to quote.
-    const wrapped = this.deps.listSessions().filter((s) => s.kind === 'wrapped' && s.sockPath);
-    if (wrapped.length === 1) {
-      await this.injectTo(env, wrapped[0].sockPath!, wrapped[0].label);
-      return;
-    }
-    if (wrapped.length > 1) {
-      await this.reply(env, { kind: 'text', text: `有 ${wrapped.length} 个活跃会话,请引用(回复)对应会话的消息来指定目标。` });
+    if (targets.length > 1) {
+      await this.reply(env, { kind: 'text', text: `有 ${targets.length} 个可接收会话,请引用(回复)对应会话的消息来指定目标。` });
       return;
     }
 
     await this.reply(env, {
       kind: 'text',
-      text: 'tlive: 无活动会话可接收文本。引用某条会话消息可将文本发入该终端(需 tlive run 包裹);命令见 /help。',
+      text: 'tlive: 无活动会话可接收文本。请先在终端启动 Codex/tlive run,或引用一条仍可恢复的 Codex 消息;命令见 /help。',
     });
   }
 
@@ -304,24 +301,51 @@ export class InboundHandler {
       }
       return;
     }
-    const cwd = this.deps.resolveReply(env.channel, env.replyToMessageId!);
-    if (!cwd) {
-      await this.reply(env, { kind: 'text', text: '找不到该消息对应的会话(daemon 可能重启过),请引用较新的消息。' });
+    const key = this.deps.resolveReply(env.channel, env.replyToMessageId!);
+    if (!key) {
+      await this.reply(env, { kind: 'text', text: '找不到该消息对应的会话,请引用 tlive 发出的会话消息。' });
       return;
     }
-    const s = this.deps.sessionInfo(cwd);
+    const s = this.deps.sessionInfo(key);
     if (!s) {
       await this.reply(env, { kind: 'text', text: '该会话已结束。' });
       return;
     }
+    if (await this.routeSession(env, s)) return;
+    await this.reply(env, { kind: 'text', text: `[${s.label}] 未用 tlive run 包裹,无法注入文本。审批请用按钮。` });
+  }
+
+  private async routeSession(
+    env: IncomingEnvelope,
+    s: { kind: 'wrapped' | 'hook'; label: string; sockPath?: string; continueId?: string; codexThreadId?: string },
+  ): Promise<boolean> {
     // A pending Stop-continue is the official resume path — prefer it over injection.
     // (Attachment-only messages skip this: an empty continue reply is meaningless.)
-    if (s.continueId && env.text && this.deps.continueBroker.answer(s.continueId, env.text)) return;
+    if (s.continueId && env.text && this.deps.continueBroker.answer(s.continueId, env.text)) {
+      await this.reply(env, { kind: 'text', text: `Sent to [${s.label}]` });
+      return true;
+    }
+    if (s.codexThreadId) {
+      await this.sendToCodex(env, s.codexThreadId, s.label);
+      return true;
+    }
     if (s.kind === 'wrapped' && s.sockPath) {
       await this.injectTo(env, s.sockPath, s.label);
-      return;
+      return true;
     }
-    await this.reply(env, { kind: 'text', text: `[${s.label}] 未用 tlive run 包裹,无法注入文本。审批请用按钮;续跑请在「续跑」提示后直接回复。` });
+    return false;
+  }
+
+  private async sendToCodex(env: IncomingEnvelope, threadId: string, label: string): Promise<void> {
+    const text = [env.text, ...(env.attachments ?? []).map((a) => a.localPath)].filter(Boolean).join('\n');
+    if (!text) return;
+    try {
+      await this.deps.sendCodex(threadId, text);
+      await this.reply(env, { kind: 'text', text: `Sent to [${label}]` });
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      await this.reply(env, { kind: 'text', text: `[${label}] 发送失败: ${reason.slice(0, 300)}` });
+    }
   }
 
   private async injectTo(env: IncomingEnvelope, sockPath: string, label: string): Promise<void> {

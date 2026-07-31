@@ -22,6 +22,7 @@ export interface CompanionDeps {
 
 export interface Companion {
   stop(): void;
+  /** Reopen a persisted thread, then start a turn or steer its active turn. */
   resume(threadId: string, input: string): Promise<void>;
 }
 
@@ -63,6 +64,32 @@ export function startCompanion(deps: CompanionDeps): Companion {
 
   const log = deps.log ?? (() => undefined);
 
+  type ResumeResult = {
+    cwd?: unknown;
+    thread?: {
+      turns?: Array<{ id?: unknown; status?: unknown }>;
+    };
+  };
+
+  /** Cache the resumed thread's cwd, register idle threads in the session list,
+   *  and return the currently-running turn id when one exists. */
+  function captureResume(threadId: string, res: unknown): string | undefined {
+    const resumedThread = res as ResumeResult | undefined;
+    const cwd = resumedThread?.cwd;
+    if (typeof cwd === 'string' && cwd) threadCwds.set(threadId, cwd);
+    const activeTurn = resumedThread?.thread?.turns?.slice().reverse().find(
+      (turn) => turn.status === 'inProgress' && typeof turn.id === 'string',
+    );
+    const key = threadKey(threadId);
+    deps.onMonitor(
+      activeTurn
+        ? { event: 'activity', cwd: cwdOf(threadId), sessionId: threadId, toolName: '(turn)', result: {} }
+        : { event: 'session-start', cwd: cwdOf(threadId), sessionId: threadId },
+      key,
+    );
+    return activeTurn?.id as string | undefined;
+  }
+
   function resumeThread(threadId: string, attempt = 1): void {
     if (stopped || !rpc) return;
     if (attempt === 1) {
@@ -70,10 +97,7 @@ export function startCompanion(deps: CompanionDeps): Companion {
       resumed.add(threadId);
     }
     rpc.call('thread/resume', { threadId }).then(
-      (res) => {
-        const cwd = (res as { cwd?: unknown } | undefined)?.cwd;
-        if (typeof cwd === 'string' && cwd) threadCwds.set(threadId, cwd);
-      },
+      (res) => { captureResume(threadId, res); },
       (err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
         if (/no rollout/i.test(msg) && attempt < RESUME_RETRY_MAX) {
@@ -286,7 +310,29 @@ export function startCompanion(deps: CompanionDeps): Companion {
     },
     async resume(threadId: string, input: string): Promise<void> {
       if (!rpc) throw new Error('companion: not connected');
-      await rpc.call('turn/start', { threadId, input: [{ type: 'text', text: input }] });
+      const items = [{ type: 'text', text: input }];
+      let activeTurnId = captureResume(threadId, await rpc.call('thread/resume', { threadId }));
+      try {
+        if (activeTurnId) {
+          await rpc.call('turn/steer', { threadId, input: items, expectedTurnId: activeTurnId });
+        } else {
+          await rpc.call('turn/start', { threadId, input: items });
+        }
+      } catch (err) {
+        // The local terminal may start/finish a turn between resume and send.
+        // Refresh once only for that state race; never retry timeouts or other
+        // failures that may already have accepted the input.
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!/active turn|turn.*(?:running|in progress)|no active turn|expectedTurnId|does not match/i.test(msg)) throw err;
+        const refreshed = captureResume(threadId, await rpc.call('thread/resume', { threadId }));
+        if (refreshed && refreshed !== activeTurnId) {
+          await rpc.call('turn/steer', { threadId, input: items, expectedTurnId: refreshed });
+        } else if (!refreshed && activeTurnId) {
+          await rpc.call('turn/start', { threadId, input: items });
+        } else {
+          throw err;
+        }
+      }
     },
   };
 }

@@ -1,8 +1,9 @@
 <div align="center">
 
-# tlive
+# tlive-custom
 
-**Vendor-neutral, self-hosted remote-approval + live-monitoring for `claude` / `codex`.**
+**Private deployment fork of [y49/tlive](https://github.com/y49/tlive).**
+Vendor-neutral, self-hosted remote-approval + live-monitoring for `claude` / `codex`.
 Approve tool calls, watch runs, take over typing — from Telegram, Feishu, or a web terminal.
 
 [![npm version](https://img.shields.io/npm/v/tlive)](https://www.npmjs.com/package/tlive)
@@ -12,6 +13,62 @@ Approve tool calls, watch runs, take over typing — from Telegram, Feishu, or a
 [English](README.md) · [简体中文](README_CN.md)
 
 </div>
+
+## 本仓库
+
+这是基于 tlive `3.0.0` 维护的个人部署版本。目标是让 Codex CLI/App Server
+通过飞书可靠地发送完成、失败和审批通知，并允许从通知卡片引用回复后继续原
+Codex thread。
+
+当前定制版本：`3.0.0-feishu-codex.2`。
+
+### 定制能力
+
+- 飞书消息和卡片回调统一使用 `open_id`，并限制为配置中的允许用户。
+- 飞书引用回复可恢复原 Codex thread；空闲 turn 使用 `turn/start`，活跃 turn
+  使用 `turn/steer`。
+- 消息到 Codex thread 的路由持久化，daemon 重启后仍可引用旧卡片继续。
+- 普通文字仅在目标会话唯一时自动路由，多个会话时要求引用目标卡片。
+- Codex `error` 与失败的 `turn/completed` 会生成 `Turn failed` 卡片，显示
+  503、模型容量不足等错误原文；自动重试中的中间错误不会制造重复通知。
+- 引用失败卡片回复“继续”会在同一 thread 新建 turn，不会删除历史、回滚文件
+  或重放上一轮。
+
+### 开发与部署
+
+项目使用 Node.js 20+ 和 pnpm：
+
+```bash
+pnpm install
+pnpm run ci
+pnpm pack --pack-destination /tmp
+```
+
+使用 `pnpm pack` 输出的 tarball 路径安装，然后重新注册 Codex 插件并重启：
+
+```bash
+npm install -g /tmp/tlive-<version>.tgz
+tlive setup --hooks-only --codex
+tlive stop
+tlive start
+tlive status
+```
+
+### 同步上游
+
+`origin` 指向本仓库，`upstream` 指向官方 `y49/tlive`：
+
+```bash
+git fetch upstream
+git merge upstream/main
+pnpm run ci
+git push origin main
+```
+
+飞书凭证、允许用户和消息路由均位于 `~/.tlive/`，不得复制进仓库。仓库中不应
+包含 `App ID`、`App Secret`、`Chat ID`、用户 `open_id` 或 Web dashboard token。
+
+---
 
 > Your `claude` / `codex` runs in your terminal as usual. tlive rides the
 > **open hook mechanism** both vendors support to push status (and, when you

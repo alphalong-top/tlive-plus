@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildCard } from '../feishu.js';
+import { buildCard, decorateFeishuText } from '../feishu.js';
 import { mdToFeishuElements } from '../feishu-card.js';
 
 type Md = { tag: 'markdown'; content: string };
@@ -114,6 +114,20 @@ describe('feishu buildCard (schema 2.0)', () => {
     expect(card.body.elements[0]).toMatchObject({ tag: 'markdown', content: 'hi' });
   });
 
+  it('adds a status icon to card titles from outcome and interaction type', () => {
+    const title = (out: Parameters<typeof buildCard>[0]) => (buildCard(out) as Card2).header?.title.content;
+    expect(title({ kind: 'card', title: 'demo · Turn finished', body: 'done' })).toBe('✅ demo · Turn finished');
+    expect(title({ kind: 'card', title: 'demo · Turn failed', body: 'boom' })).toBe('❌ demo · Turn failed');
+    expect(title({ kind: 'card', title: 'demo · Bash', body: 'rm x', buttons: [{ id: 'approve:1', label: 'Allow' }] })).toBe('⚠️ demo · Bash');
+    expect(title({ kind: 'card', title: 'demo · Question', body: 'Pick', inputAction: { id: 'askinput:1', placeholder: 'Answer', submitLabel: 'Send' } })).toBe('💬 demo · Question');
+    expect(title({ kind: 'card', title: 'tlive · commands', body: 'help' })).toBe('ℹ️ tlive · commands');
+  });
+
+  it('replaces an existing status icon instead of stacking prefixes', () => {
+    const card = buildCard({ kind: 'card', title: '⚠️ demo · Turn failed', body: 'boom' }) as Card2;
+    expect(card.header!.title.content).toBe('❌ demo · Turn failed');
+  });
+
   it('renders buttons two per column_set row, as callback behaviors carrying the button id', () => {
     const card = buildCard({
       kind: 'card',
@@ -207,5 +221,17 @@ describe('feishu buildCard (schema 2.0)', () => {
     const btns = (card.body.elements.filter((e) => e.tag === 'column_set') as Array<{ columns: Array<{ elements: Array<{ type?: string }> }> }>)
       .flatMap((r) => r.columns.map((c) => c.elements[0]));
     expect(btns.map((b) => b.type)).toEqual(['primary', 'danger', 'default', 'default']);
+  });
+});
+
+describe('decorateFeishuText', () => {
+  it.each([
+    ['Bash failed: permission denied', '❌ Bash failed: permission denied'],
+    ['⚠️ Bash failed: permission denied', '❌ Bash failed: permission denied'],
+    ['Sent to [demo]', '✅ Sent to [demo]'],
+    ['This request is no longer active — the session ended.', '⚠️ This request is no longer active — the session ended.'],
+    ['Mode: full → notify', 'ℹ️ Mode: full → notify'],
+  ])('decorates %s', (input, expected) => {
+    expect(decorateFeishuText(input)).toBe(expected);
   });
 });

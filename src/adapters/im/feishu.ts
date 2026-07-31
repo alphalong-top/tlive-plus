@@ -26,6 +26,37 @@ export interface FeishuAdapterOpts {
 
 type CardMessage = Extract<OutgoingMessage, { kind: 'card' }>;
 
+type StatusIcon = '✅' | '❌' | '⚠️' | '💬' | 'ℹ️';
+
+const STATUS_PREFIX = /^(?:✅|❌|⚠️|💬|ℹ️)\s*/u;
+
+function withStatusIcon(text: string, icon: StatusIcon): string {
+  const bare = text.replace(STATUS_PREFIX, '').trimStart();
+  return bare ? `${icon} ${bare}` : text;
+}
+
+function cardStatusIcon(out: CardMessage): StatusIcon {
+  const title = (out.title ?? '').replace(STATUS_PREFIX, '');
+  if (/\b(?:failed|failure|denied|rejected|error)\b|\u5931\u8d25|\u9519\u8bef|\u62d2\u7edd/iu.test(title)) return '❌';
+  if (/\b(?:timed out|expired|session ended|handed back)\b|\u8fc7\u671f|\u5df2\u7ed3\u675f/iu.test(title)) return '⚠️';
+  if (/\b(?:finished|completed|allowed|approved|answered|restored|selected)\b|\u5b8c\u6210|\u6210\u529f|\u5df2\u653e\u884c|\u5df2\u6062\u590d|\u5df2\u9009\u62e9/iu.test(title)) return '✅';
+  if (out.buttons?.some((b) => b.id.startsWith('approve:') || b.id.startsWith('deny:'))) return '⚠️';
+  if (out.ask || out.inputAction) return '💬';
+  return 'ℹ️';
+}
+
+export function decorateFeishuText(text: string): string {
+  const bare = text.replace(STATUS_PREFIX, '');
+  const icon: StatusIcon = /\b(?:no longer active|timed out|expired|waiting|needs? your|paused|muted|no active session)\b|\u7b49\u5f85|\u8fc7\u671f|\u6682\u505c|\u65e0\u6d3b\u52a8\u4f1a\u8bdd/iu.test(bare)
+    ? '⚠️'
+    : /\b(?:failed|failure|error|denied|rejected|could not|cannot|unknown command)\b|\u5931\u8d25|\u9519\u8bef|\u62d2\u7edd|\u627e\u4e0d\u5230|\u65e0\u6cd5/iu.test(bare)
+      ? '❌'
+      : /\b(?:sent|approved|allowed|received|restored|selected|finished|completed|resumed)\b|\u6210\u529f|\u5df2\u53d1\u9001|\u5df2\u653e\u884c|\u5df2\u6062\u590d|\u5df2\u9009\u62e9/iu.test(bare)
+        ? '✅'
+        : 'ℹ️';
+  return withStatusIcon(text, icon);
+}
+
 /** 按钮语义 → 飞书按钮样式:放行=primary、拒绝=danger,其余(Always allow /
  *  Pause / ask 选项…)一律 default —— 满屏 primary 会淹没真正的主动作。 */
 function buttonType(id: string): 'primary' | 'danger' | 'default' {
@@ -115,7 +146,7 @@ export function buildCard(out: CardMessage): object {
     ...(out.title
       ? {
           header: {
-            title: { tag: 'plain_text', content: out.title },
+            title: { tag: 'plain_text', content: withStatusIcon(out.title, cardStatusIcon(out)) },
             // Header colour = the card's demand on you at a glance: blue when
             // it needs an action (approval / question buttons or a reply box),
             // the plain white `default` when it's just informational
@@ -271,7 +302,7 @@ export class FeishuAdapter implements IMAdapter {
     if (!this.opts.chatId) throw new Error('feishu chatId not configured');
     const data = out.kind === 'card'
       ? { receive_id: this.opts.chatId, msg_type: 'interactive', content: JSON.stringify(buildCard(out)) }
-      : { receive_id: this.opts.chatId, msg_type: 'text', content: JSON.stringify({ text: out.text }) };
+      : { receive_id: this.opts.chatId, msg_type: 'text', content: JSON.stringify({ text: decorateFeishuText(out.text) }) };
     const res = await this.client.im.v1.message.create({ params: { receive_id_type: 'chat_id' }, data });
     return { messageId: (res as { data?: { message_id?: string } }).data?.message_id ?? '' };
   }
@@ -280,7 +311,7 @@ export class FeishuAdapter implements IMAdapter {
     if (!this.client) throw new Error('feishu not connected');
     const content = out.kind === 'card'
       ? JSON.stringify(buildCard(out))
-      : JSON.stringify({ text: out.text });
+      : JSON.stringify({ text: decorateFeishuText(out.text) });
     await this.client.im.v1.message.patch({ path: { message_id: messageId }, data: { content } });
   }
 

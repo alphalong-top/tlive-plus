@@ -39,6 +39,9 @@ sessions (disable via `daemon.autoStart: false`).
 - `tlive logs -f` — follow the daemon log.
 - `tlive start` / `tlive stop` — explicit lifecycle (start is rarely needed;
   sessions lazy-start the daemon unless autoStart is off).
+- In IM chat, `/sessions [search]` pages through current and historical Codex
+  threads; `/sessions archived [search]` browses archived threads. Select one,
+  then use the Feishu card input or quote-reply on other channels to continue.
 
 ## Diagnostics
 1. No IM messages: `tlive status` for channel config; `tlive logs -f` for send

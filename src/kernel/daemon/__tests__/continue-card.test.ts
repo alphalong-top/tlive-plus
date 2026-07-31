@@ -15,6 +15,10 @@ describe('buildContinueCardBody', () => {
     expect(buildContinueCardBody('')).toBe('\n*Reply to this message to continue.*');
   });
 
+  it('omits the quote-reply hint when the channel has an inline input', () => {
+    expect(buildContinueCardBody('All green.', false, false)).toBe('\n>! All green.');
+  });
+
   it('shows a failed turn error directly while keeping the continue action', () => {
     expect(buildContinueCardBody('503 Service Unavailable\nModel at capacity', true)).toBe(
       '\n503 Service Unavailable\nModel at capacity\n\n*Reply to this message to continue.*',

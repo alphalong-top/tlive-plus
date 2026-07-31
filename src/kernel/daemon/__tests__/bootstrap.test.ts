@@ -9,6 +9,7 @@ import { SessionRegistry } from '../../web/session-registry';
 import { until } from '../../__tests__/wait.js';
 import { writeMode } from '../../config/mode.js';
 import { mdToTelegramHtml } from '../../../adapters/im/telegram-html.js';
+import { BUILD_ID } from '../../build-id.js';
 
 // #45 — robustness helpers for this file's "held request" pattern
 // (const pending = request(...); …asserts…; await pending). On a slow/jittery
@@ -39,7 +40,7 @@ describe('daemon bootstrap', () => {
   it('starts and answers daemon.status', async () => {
     h = await bootstrapDaemon({ home: tmp });
     const r = await request({ kind: 'daemon.status' }, { socketPath: daemonSocketPath(tmp), timeoutMs: 2000 });
-    expect(r.kind).toBe('daemon.status');
+    expect(r).toMatchObject({ kind: 'daemon.status', buildId: BUILD_ID });
   });
 
   it('reports codex: off when the app-server custody cannot be established', async () => {

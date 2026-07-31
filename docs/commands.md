@@ -173,8 +173,9 @@ subcommands.
 | `/trust on\|off` | Pause approvals (auto-allow everything) until turned off. High-risk; prefer the per-tool "Always allow" button. |
 | `/safe on\|off` | Auto-allow routine ops (non-dangerous Bash, non-sensitive edits); the danger floor still asks. |
 | `/mode off\|notify\|full\|all` | Set posture. A bare `/mode` replies with a card listing the ladder and marking the current rung, with tap-to-switch buttons. |
+| `/sessions [search]` | Browse current and historical Codex threads. Use `/sessions archived [search]` for archived threads; cards provide pagination and selection buttons. |
 | `/help` | Show in-chat help. |
-| *quote-reply + text* | Typed into that session's terminal (wrapped sessions). |
+| *Feishu card input / quote-reply + text* | Resume a selected Codex thread or type into a wrapped session's terminal. |
 | *photo / file* | Downloaded to `~/.tlive/inbox`; path injected into the session. |
 
 Tapping a bare command from the client's command menu (which sends `/mute`,
@@ -182,6 +183,12 @@ Tapping a bare command from the client's command menu (which sends `/mute`,
 buttons instead of an error — a menu tap can never one-shot enable a dangerous
 state like `/trust`. A bare `/mode` works the same way, but replies with the
 full ladder (see above) instead of a plain on/off pair.
+
+Selecting a non-archived thread sends a thread-specific card. On Feishu, type
+into the card and press Continue; on other channels, quote-reply it. Selecting
+an archived thread first restores it, then sends the same target. Pagination buttons are daemon-memory state;
+after a restart, run `/sessions` again. The selected thread card itself is
+persistently routed and remains replyable across daemon restarts.
 
 ---
 

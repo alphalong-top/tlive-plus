@@ -45,6 +45,75 @@ describe('companion', () => {
     comp.stop();
   });
 
+  it('replays a missed approval when a subscribed thread later starts waiting', async () => {
+    let events: any;
+    let waiting = false;
+    let resumeCount = 0;
+    const replayResponses: Array<ReturnType<typeof vi.fn>> = [];
+    const rpc = {
+      call: vi.fn(async (method: string, params: any) => {
+        if (method === 'thread/loaded/list') return { data: ['t1'] };
+        if (method === 'thread/list') return {
+          data: [{
+            id: 't1', preview: '', cwd: '/repo', createdAt: 1, updatedAt: 1,
+            status: { type: 'active', activeFlags: waiting ? ['waitingOnApproval'] : [] },
+          }],
+        };
+        if (method === 'thread/resume') {
+          resumeCount++;
+          if (waiting) {
+            const respond = vi.fn();
+            replayResponses.push(respond);
+            events.onServerRequest(
+              `approval-${resumeCount}`,
+              'item/commandExecution/requestApproval',
+              { threadId: params.threadId, itemId: 'item-1', command: 'pnpm test', cwd: '/repo' },
+              respond,
+            );
+          }
+          return { cwd: '/repo', thread: { id: params.threadId } };
+        }
+        return {};
+      }),
+      notify: vi.fn(),
+      close: vi.fn(),
+    };
+    let resolveApproval!: (result: { decision: 'allow' }) => void;
+    const router = {
+      requestPermission: vi.fn(() => new Promise<{ decision: 'allow' }>((resolve) => { resolveApproval = resolve; })),
+      cancel: vi.fn(() => 0),
+    };
+    const comp = startCompanion({
+      connect: async (e: any) => { events = e; return rpc as any; },
+      permissionRouter: router as any,
+      onMonitor: vi.fn(),
+      onResumePrompt: vi.fn(),
+      windowSec: () => 86_400,
+    });
+
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(resumeCount).toBe(1);
+
+    waiting = true;
+    await vi.advanceTimersByTimeAsync(5000);
+    await Promise.resolve();
+    expect(resumeCount).toBe(2);
+    expect(router.requestPermission).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(5000);
+    await Promise.resolve();
+    expect(resumeCount).toBe(3);
+    expect(router.requestPermission).toHaveBeenCalledTimes(1);
+
+    resolveApproval({ decision: 'allow' });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(replayResponses).toHaveLength(2);
+    for (const respond of replayResponses) expect(respond).toHaveBeenCalledWith({ decision: 'accept' });
+    comp.stop();
+  });
+
   it('resume retries on no-rollout then succeeds', async () => {
     const calls: any[] = [];
     let events: any;
@@ -101,6 +170,7 @@ describe('companion', () => {
       toolName: 'Bash',
       timeoutSec: 86_400,
       sessionId: 't1',
+      requestKey: 'i1',
       input: expect.objectContaining({ command: 'rm -rf /', cwd: '/w' }),
     }));
     expect(respond).toHaveBeenCalledWith({ decision: 'accept' });
@@ -138,7 +208,10 @@ describe('companion', () => {
     const events = getEvents();
 
     events.onNotify('item/completed', { threadId: 't1', item: { type: 'commandExecution' } });
-    expect(router.cancel).toHaveBeenCalledWith({ key: 'codex:t1', toolName: 'Bash', sessionId: 't1' });
+    expect(router.cancel).not.toHaveBeenCalled();
+
+    events.onNotify('item/completed', { threadId: 't1', item: { id: 'i1', type: 'commandExecution' } });
+    expect(router.cancel).toHaveBeenCalledWith({ key: 'codex:t1', toolName: 'Bash', sessionId: 't1', requestKey: 'i1' });
 
     events.onNotify('turn/completed', { threadId: 't1' });
     expect(router.cancel).toHaveBeenCalledWith({ key: 'codex:t1' });
@@ -148,6 +221,7 @@ describe('companion', () => {
   it('reconnects after onClose with backoff and stop() ends the loop', async () => {
     let connectCount = 0;
     let events: any;
+    const states: string[] = [];
     const rpc = {
       call: vi.fn(async (method: string) => (method === 'thread/loaded/list' ? { data: [] } : {})),
       notify: vi.fn(),
@@ -160,16 +234,20 @@ describe('companion', () => {
       onMonitor: vi.fn(),
       onResumePrompt: vi.fn(),
       windowSec: () => 86_400,
+      onStateChange: (state) => { states.push(state); },
     });
     await Promise.resolve();
     await Promise.resolve();
     expect(connectCount).toBe(1);
+    expect(states).toEqual(['running']);
 
     events.onClose();
+    expect(states.at(-1)).toBe('degraded');
     await vi.advanceTimersByTimeAsync(1000);
     await Promise.resolve();
     await Promise.resolve();
     expect(connectCount).toBe(2);
+    expect(states.at(-1)).toBe('running');
 
     events.onClose();
     await vi.advanceTimersByTimeAsync(2000);
@@ -343,6 +421,50 @@ describe('companion', () => {
     await comp.resume('t1', 'fix tests');
     expect(calls.some((c) => c.method === 'turn/start' && c.params.threadId === 't1'
       && Array.isArray(c.params.input) && c.params.input[0].text === 'fix tests')).toBe(true);
+    comp.stop();
+  });
+
+  it('listThreads maps thread/list pagination and drops malformed entries', async () => {
+    const { comp, rpc } = harness();
+    await vi.runOnlyPendingTimersAsync();
+    await Promise.resolve();
+    await Promise.resolve();
+    rpc.call.mockImplementation(async (method: string) => method === 'thread/list' ? {
+      data: [
+        {
+          id: 'history-1', preview: 'fix checkout', cwd: '/repo', createdAt: 10, updatedAt: 20,
+          recencyAt: 30, name: 'Checkout', status: { type: 'notLoaded' },
+        },
+        { id: '', status: { type: 'idle' } },
+        { id: 'bad-status', status: { type: 'archived' } },
+      ],
+      nextCursor: 'next-1',
+    } : {});
+
+    await expect(comp.listThreads({ limit: 6, archived: false, searchTerm: 'checkout' })).resolves.toEqual({
+      threads: [{
+        id: 'history-1', preview: 'fix checkout', cwd: '/repo', createdAt: 10, updatedAt: 20,
+        recencyAt: 30, name: 'Checkout', status: { type: 'notLoaded' },
+      }],
+      nextCursor: 'next-1',
+    });
+    expect(rpc.call).toHaveBeenCalledWith('thread/list', {
+      limit: 6,
+      archived: false,
+      sortKey: 'recency_at',
+      sortDirection: 'desc',
+      searchTerm: 'checkout',
+    }, 30_000);
+    comp.stop();
+  });
+
+  it('unarchiveThread delegates to thread/unarchive', async () => {
+    const { comp, rpc } = harness();
+    await vi.runOnlyPendingTimersAsync();
+    await Promise.resolve();
+    await Promise.resolve();
+    await comp.unarchiveThread('old-thread');
+    expect(rpc.call).toHaveBeenCalledWith('thread/unarchive', { threadId: 'old-thread' });
     comp.stop();
   });
 

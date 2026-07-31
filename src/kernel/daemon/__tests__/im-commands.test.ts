@@ -21,6 +21,12 @@ describe('parseImCommand (mute/help/trust/safe)', () => {
   it('recognizes /help', () => {
     expect(parseImCommand('/help')).toEqual({ kind: 'help' });
   });
+  it('parses /sessions search and archived filters', () => {
+    expect(parseImCommand('/sessions')).toEqual({ kind: 'sessions', archived: false });
+    expect(parseImCommand('/sessions checkout bug')).toEqual({ kind: 'sessions', archived: false, searchTerm: 'checkout bug' });
+    expect(parseImCommand('/sessions archived old task')).toEqual({ kind: 'sessions', archived: true, searchTerm: 'old task' });
+    expect(parseImCommand('/sessions@tlive_bot archived')).toEqual({ kind: 'sessions', archived: true });
+  });
   it('returns null for non-command text', () => {
     expect(parseImCommand('hello there')).toBeNull();
   });

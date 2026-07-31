@@ -12,6 +12,8 @@ import { STALE_CARD_NOTICE } from './bootstrap.js';
 import { SAFE_TOGGLE_MESSAGE } from '../permission/policy-engine.js';
 import { MODES, MODE_DESC } from '../config/mode.js';
 import type { ShimMode } from '../hook/normalizer.js';
+import { basename } from 'node:path';
+import type { CodexThreadListQuery, CodexThreadPage, CodexThreadSummary } from '../codex/companion.js';
 
 export interface InboundHandlerDeps {
   senderGuard: SenderGuard;
@@ -55,6 +57,12 @@ export interface InboundHandlerDeps {
   sessionInfo: (key: string) => { kind: 'wrapped' | 'hook'; label: string; sockPath?: string; continueId?: string; codexThreadId?: string } | undefined;
   /** All current sessions (for bare-text single-session routing). */
   listSessions: () => Array<{ cwd: string; kind: 'wrapped' | 'hook'; label: string; sockPath?: string; continueId?: string; codexThreadId?: string }>;
+  /** Persisted Codex thread browser. */
+  listCodexThreads: (query: CodexThreadListQuery) => Promise<CodexThreadPage>;
+  /** Restore an archived Codex thread before making it reply-addressable. */
+  unarchiveCodexThread: (threadId: string) => Promise<void>;
+  /** Persist a newly-sent thread card so quote-replies survive daemon restarts. */
+  rememberSessionMessage: (channel: string, messageId: string, key: string) => void;
   /** Inject text into a wrapped session's pty (bracketed paste + Enter). */
   inject: (sockPath: string, text: string) => Promise<void>;
   /** Reopen a Codex app-server thread, then start or steer its turn. */
@@ -93,8 +101,57 @@ function parseModeCallback(text: string): ShimMode | null {
   return MODES.includes(level as ShimMode) ? (level as ShimMode) : null;
 }
 
+const SESSION_PAGE_SIZE = 6;
+const SESSION_ACTION_LIMIT = 200;
+
+interface SessionPageState {
+  archived: boolean;
+  searchTerm?: string;
+  cursor?: string;
+  previousCursors: Array<string | undefined>;
+}
+
+type SessionAction =
+  | { kind: 'page'; state: SessionPageState }
+  | { kind: 'select'; thread: CodexThreadSummary; archived: boolean };
+
+function oneLine(value: string, max: number): string {
+  const text = value.replace(/\s+/g, ' ').trim().replace(/[`*_~]/g, '');
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+function threadLabel(thread: CodexThreadSummary): string {
+  return oneLine(thread.name || basename(thread.cwd) || thread.preview || thread.id.slice(0, 8), 42);
+}
+
+function threadStatus(thread: CodexThreadSummary): string {
+  if (thread.status.type !== 'active') return thread.status.type === 'notLoaded' ? 'history' : thread.status.type;
+  if (thread.status.activeFlags.includes('waitingOnApproval')) return 'approval';
+  if (thread.status.activeFlags.includes('waitingOnUserInput')) return 'input';
+  return 'active';
+}
+
+function threadTime(thread: CodexThreadSummary): string {
+  const seconds = thread.recencyAt ?? thread.updatedAt ?? thread.createdAt;
+  const date = new Date(seconds * 1000);
+  return seconds > 0 && Number.isFinite(date.getTime())
+    ? date.toISOString().slice(0, 16).replace('T', ' ') + 'Z'
+    : 'unknown time';
+}
+
 export class InboundHandler {
+  private sessionActions = new Map<string, SessionAction>();
+  private nextSessionAction = 1;
+
   constructor(private deps: InboundHandlerDeps) {}
+
+  private rememberSessionAction(action: SessionAction): string {
+    // ponytail: 200 recent actions cover normal browsing; persist only if old card buttons must survive restarts.
+    while (this.sessionActions.size >= SESSION_ACTION_LIMIT) this.sessionActions.delete(this.sessionActions.keys().next().value!);
+    const token = (this.nextSessionAction++).toString(36);
+    this.sessionActions.set(token, action);
+    return `sessions:${token}`;
+  }
 
   async handle(env: IncomingEnvelope): Promise<void> {
     if (!this.deps.senderGuard.allows(env.channel, env.userId)) return;
@@ -233,6 +290,11 @@ export class InboundHandler {
       return;
     }
 
+    if (env.text.startsWith('sessions:')) {
+      await this.runSessionAction(env, env.text.slice('sessions:'.length));
+      return;
+    }
+
     const cmd = parseImCommand(env.text);
     if (cmd) {
       await this.runCommand(env, cmd);
@@ -248,8 +310,20 @@ export class InboundHandler {
         await this.applyAskStep(env, rid, this.deps.askFlow.submit(rid, env.formText));
         return;
       }
-      // (The continuation card has no on-card input box; continuing is done by
-      // quote-replying to the card — see routeReply below.)
+      const continuation = /^continue:(.+)$/.exec(env.text);
+      if (continuation) {
+        if (this.deps.continueBroker.answer(continuation[1], env.formText)) {
+          await this.reply(env, { kind: 'text', text: 'Sent to session' });
+        } else {
+          await this.reply(env, { kind: 'text', text: STALE_CARD_NOTICE });
+        }
+        return;
+      }
+      const codex = /^codexinput:(.+)$/.exec(env.text);
+      if (codex) {
+        await this.sendToCodex({ ...env, text: env.formText }, codex[1], 'Codex thread');
+        return;
+      }
     }
 
     // Reply-to routing: quoting a tlive message targets that message's session.
@@ -436,6 +510,13 @@ export class InboundHandler {
         });
         return;
       }
+      case 'sessions':
+        await this.showSessions(env, {
+          archived: cmd.archived,
+          ...(cmd.searchTerm ? { searchTerm: cmd.searchTerm } : {}),
+          previousCursors: [],
+        });
+        return;
       case 'toggle-prompt': {
         // Bare /mute /trust /safe (a menu tap sends the command with no arg). Reply
         // with explicit on/off buttons instead of "Unknown command" — the tap is now
@@ -464,9 +545,10 @@ export class InboundHandler {
             '`/trust on|off` — pause / resume approvals (auto-allow all)',
             '`/safe on|off` — auto-allow routine ops, still ask for dangerous / unknown',
             '`/mode off|notify|full|all` — posture: how much tlive intercepts (bare `/mode` shows the ladder)',
+            '`/sessions [search]` — browse Codex threads (`archived [search]` for archived)',
             '`/help` — this help',
             '',
-            '**Reply to a session** — quote-reply its message and your text is injected into that terminal (needs a `tlive run` wrapper). With a single active session, just send text.',
+            '**Reply to a session** — quote-reply a selected Codex card to resume that thread, or a wrapped-session message to type into its terminal. With a single active session, just send text.',
             '',
             'IM and desktop are separate: `/mute` only silences IM. Desktop toasts have their own machine-local switch, `tlive desktop on|off` (not an IM command).',
           ].join('\n'),
@@ -478,9 +560,123 @@ export class InboundHandler {
     }
   }
 
-  private async reply(env: IncomingEnvelope, msg: OutgoingMessage): Promise<void> {
+  private async runSessionAction(env: IncomingEnvelope, token: string): Promise<void> {
+    const action = this.sessionActions.get(token);
+    if (!action) {
+      await this.reply(env, { kind: 'text', text: 'This session list expired — run /sessions again.' });
+      return;
+    }
+    if (action.kind === 'page') {
+      await this.showSessions(env, action.state, true);
+      return;
+    }
+
+    const { thread, archived } = action;
+    try {
+      if (archived) {
+        await this.deps.unarchiveCodexThread(thread.id);
+        action.archived = false;
+      }
+      const sent = await this.reply(env, {
+        kind: 'card',
+        title: archived ? 'Codex thread restored' : 'Codex thread selected',
+        body: [
+          `**${threadLabel(thread)}**`,
+          `\`${oneLine(thread.cwd || thread.id, 160)}\``,
+          ...(env.channel === 'feishu' ? [] : ['', 'Quote-reply to this card to continue the thread.']),
+        ].join('\n'),
+        ...(env.channel === 'feishu' ? {
+          inputAction: { id: `codexinput:${thread.id}`, placeholder: 'Message this thread', submitLabel: 'Continue' },
+        } : {}),
+      });
+      if (sent?.messageId) this.deps.rememberSessionMessage(env.channel, sent.messageId, `codex:${thread.id}`);
+    } catch (err) {
+      await this.reply(env, { kind: 'text', text: `Could not ${archived ? 'restore' : 'select'} the Codex thread: ${err instanceof Error ? err.message : String(err)}` });
+    }
+  }
+
+  private async showSessions(env: IncomingEnvelope, state: SessionPageState, edit = false): Promise<void> {
+    try {
+      const page = await this.deps.listCodexThreads({
+        limit: SESSION_PAGE_SIZE,
+        archived: state.archived,
+        ...(state.cursor ? { cursor: state.cursor } : {}),
+        ...(state.searchTerm ? { searchTerm: state.searchTerm } : {}),
+      });
+      const body: string[] = [
+        `**${state.archived ? 'Archived' : 'Current & history'}** · page ${state.previousCursors.length + 1}`,
+        ...(state.searchTerm ? [`Search: \`${oneLine(state.searchTerm, 80)}\``] : []),
+        '',
+      ];
+      if (!page.threads.length) body.push('No matching Codex threads.');
+      for (const [i, thread] of page.threads.entries()) {
+        const preview = oneLine(thread.preview, 120);
+        body.push(
+          `**${i + 1}. ${threadLabel(thread)}** · \`${state.archived ? 'archived' : threadStatus(thread)}\``,
+          `\`${oneLine(thread.cwd || thread.id, 160)}\` · ${threadTime(thread)}`,
+          ...(preview ? [preview] : []),
+          '',
+        );
+      }
+
+      const buttons = page.threads.map((thread, i) => ({
+        id: this.rememberSessionAction({ kind: 'select', thread, archived: state.archived }),
+        label: `${i + 1}. ${state.archived ? 'Restore' : 'Select'}`,
+      }));
+      if (state.previousCursors.length) {
+        const previousCursors = state.previousCursors.slice(0, -1);
+        const cursor = state.previousCursors[state.previousCursors.length - 1];
+        buttons.push({
+          id: this.rememberSessionAction({
+            kind: 'page',
+            state: {
+              archived: state.archived,
+              ...(state.searchTerm ? { searchTerm: state.searchTerm } : {}),
+              ...(cursor ? { cursor } : {}),
+              previousCursors,
+            },
+          }),
+          label: 'Previous',
+        });
+      }
+      if (page.nextCursor) {
+        buttons.push({
+          id: this.rememberSessionAction({
+            kind: 'page',
+            state: {
+              archived: state.archived,
+              ...(state.searchTerm ? { searchTerm: state.searchTerm } : {}),
+              cursor: page.nextCursor,
+              previousCursors: [...state.previousCursors, state.cursor],
+            },
+          }),
+          label: 'Next',
+        });
+      }
+      buttons.push({
+        id: this.rememberSessionAction({
+          kind: 'page',
+          state: {
+            archived: !state.archived,
+            ...(state.searchTerm ? { searchTerm: state.searchTerm } : {}),
+            previousCursors: [],
+          },
+        }),
+        label: state.archived ? 'Current & history' : 'Archived',
+      });
+
+      const card: OutgoingMessage = { kind: 'card', title: 'tlive · Codex sessions', body: body.join('\n').trim(), buttons };
+      const adapter = this.deps.imBy(env.channel);
+      if (edit && adapter && env.messageId) await adapter.edit(env.messageId, card);
+      else await this.reply(env, card);
+    } catch (err) {
+      await this.reply(env, { kind: 'text', text: `Could not list Codex threads: ${err instanceof Error ? err.message : String(err)}` });
+    }
+  }
+
+  private async reply(env: IncomingEnvelope, msg: OutgoingMessage): Promise<{ messageId: string } | undefined> {
     const a = this.deps.imBy(env.channel);
     if (!a) return;
-    await a.send(msg);
+    return a.send(msg);
   }
 }

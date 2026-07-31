@@ -40,8 +40,9 @@ function buttonType(id: string): 'primary' | 'danger' | 'default' {
  *  near-passthrough now), and strict validation (unknown attrs REJECT the
  *  send — keep this builder minimal). Buttons live directly in body.elements
  *  (2.0 shape), two per column_set row to mirror the TG layout. An
- *  `inputAction` renders a form with a multiline input + submit — the native
- *  "answer in your own words" box (V6.8+, works in 1.0 and 2.0).
+ *  `inputAction` renders a form with a native input + submit (V6.8+, works in
+ *  1.0 and 2.0). Session continuation stays single-line; free-form questions
+ *  keep the multiline editor.
  *  Header gets the `blue` template only while the card is actionable; an
  *  informational/settled card uses the plain white `default` (no colour bar). */
 export function buildCard(out: CardMessage): object {
@@ -86,11 +87,12 @@ export function buildCard(out: CardMessage): object {
           // Feishu enforces this client-side. On a multi-select ask the ticks
           // ARE the answer and the text merely rides along, so requiring it
           // made the primary path unsubmittable ("必填项") while the
-          // placeholder promised it was optional. Everywhere else — a
-          // single-select ask, any future non-ask form — typing is the only
-          // input there is, so it stays required.
-          required: !out.ask?.multiSelect,
-          input_type: 'multiline_text',
+          // placeholder promised it was optional. Continue inputs also stay
+          // optional so clearing a desktop field does not leave Feishu's red
+          // "required" warning behind; empty submits are rejected below with
+          // a transient toast. Everywhere else, typing is the only answer.
+          required: out.inputAction.id.startsWith('continue:') ? false : !out.ask?.multiSelect,
+          input_type: out.inputAction.id.startsWith('continue:') ? 'text' : 'multiline_text',
           placeholder: { tag: 'plain_text', content: out.inputAction.placeholder },
         },
         {
@@ -234,6 +236,9 @@ export class FeishuAdapter implements IMAdapter {
         const act = d.action as { form_value?: Record<string, unknown>; input_value?: unknown } | undefined;
         const typedRaw = act?.form_value ? act.form_value['reply'] : act?.input_value;
         const typed = typeof typedRaw === 'string' && typedRaw.trim() ? typedRaw : undefined;
+        if (val?.startsWith('continue:') && !typed) {
+          return { toast: { type: 'warning', content: 'Enter a message' } };
+        }
         if (val && this.inboundHandler) {
           this.inboundHandler({
             channel: 'feishu',

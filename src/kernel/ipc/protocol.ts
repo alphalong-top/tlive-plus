@@ -52,7 +52,7 @@ export type IpcRequest =
   | { kind: 'session.list' };
 
 export type IpcResponse =
-  | { kind: 'daemon.status'; uptimeMs: number; pid: number; codex?: 'running' | 'degraded' | 'off' }
+  | { kind: 'daemon.status'; uptimeMs: number; pid: number; buildId?: string; codex?: 'running' | 'degraded' | 'off' }
   | { kind: 'daemon.stopped' }
   | { kind: 'ack' }
   | { kind: 'hook.permission.result'; decision: 'allow' | 'deny' | 'defer'; message?: string; updatedInput?: unknown }

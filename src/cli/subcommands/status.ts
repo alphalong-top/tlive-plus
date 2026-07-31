@@ -8,6 +8,7 @@ import { effectiveMode } from '../../kernel/hook/normalizer.js';
 import { MODE_DESC } from '../../kernel/config/mode.js';
 import { resolveWebUrls, printWebBanner } from '../web-url.js';
 import { pluginHealth, defaultRunner } from '../../kernel/integrations/plugin-install.js';
+import { isCurrentBuild } from '../../kernel/build-id.js';
 
 export async function runStatus(_argv: string[]): Promise<void> {
   const home = process.env.TLIVE_HOME ?? join(homedir(), '.tlive');
@@ -16,7 +17,9 @@ export async function runStatus(_argv: string[]): Promise<void> {
     const r = await request({ kind: 'daemon.status' }, { timeoutMs: 2000 });
     if (r.kind === 'daemon.status') {
       daemonOk = true;
-      process.stdout.write(`daemon:   running (pid ${r.pid}, uptime ${(r.uptimeMs / 1000).toFixed(0)}s)\n`);
+      const current = isCurrentBuild(r.buildId);
+      process.stdout.write(`daemon:   running (pid ${r.pid}, uptime ${(r.uptimeMs / 1000).toFixed(0)}s${current ? '' : ', outdated build'})\n`);
+      if (!current) process.stdout.write('update:   run `tlive start` to restart into the installed build\n');
       if (r.codex === 'running') {
         process.stdout.write('codex:    app-server companion running\n');
       } else if (r.codex === 'degraded') {

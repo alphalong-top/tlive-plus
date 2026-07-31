@@ -136,6 +136,17 @@ describe('FeishuAdapter', () => {
       expect(inbound.mock.calls[0][0]).toMatchObject({ chatId: 'chat-ok', text: 'approve:abc' });
     });
 
+    it('returns a warning toast instead of forwarding an empty continuation', async () => {
+      const callback = makeCallback('chat-ok', 'continue:r1') as ReturnType<typeof makeCallback> & {
+        action: { value: { tlive: string }; form_value: { reply: string } };
+      };
+      callback.action.form_value = { reply: '   ' };
+      await expect(capturedHandlers['card.action.trigger'](callback)).resolves.toEqual({
+        toast: { type: 'warning', content: 'Enter a message' },
+      });
+      expect(inbound).not.toHaveBeenCalled();
+    });
+
     it('uses open_id consistently for callback allowlisting', async () => {
       const callback = makeCallback('chat-ok', 'approve:abc');
       callback.operator = { user_id: 'tenant-user', open_id: 'open-user-1' } as typeof callback.operator;

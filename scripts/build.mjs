@@ -6,12 +6,28 @@
 //   - dist/src/tlive-cli.mjs    (CLI dispatcher, src/cli/main.ts; lazy-imports subcommands)
 
 import { build } from 'esbuild';
-import { existsSync, mkdirSync, copyFileSync, chmodSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, copyFileSync, chmodSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, '..');
+
+function sourceFiles(dir) {
+  return readdirSync(dir).flatMap((name) => {
+    const path = join(dir, name);
+    return statSync(path).isDirectory() ? sourceFiles(path) : [path];
+  });
+}
+
+const BUILD_ID = createHash('sha256')
+  .update([join(ROOT, 'package.json'), join(ROOT, 'scripts', 'build.mjs'), ...sourceFiles(join(ROOT, 'src'))]
+    .sort()
+    .map((path) => `${relative(ROOT, path)}\0${readFileSync(path)}\0`)
+    .join(''))
+  .digest('hex')
+  .slice(0, 12);
 
 const EXTERNAL = [
   'node-pty',
@@ -35,6 +51,7 @@ async function buildEntry(entryRel, outBaseName, { shebang = false } = {}) {
     format: 'esm',
     outfile: join(ROOT, 'dist', 'src', `${outBaseName}.mjs`),
     external: EXTERNAL,
+    define: { __TLIVE_BUILD_ID__: JSON.stringify(BUILD_ID) },
     // The CLI is the package `bin` — it must be directly executable when linked as `tlive`.
     ...(shebang ? { banner: { js: '#!/usr/bin/env node' } } : {}),
     logLevel: 'warning',

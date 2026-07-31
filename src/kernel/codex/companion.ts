@@ -17,13 +17,45 @@ export interface CompanionDeps {
   onResumePrompt: (p: { threadId: string; key: string; lastMessage?: string; error?: string }) => void;
   /** 远程审批窗口(秒),与 CC 共用 approvals.windowSec —— 消除"一家可配一家硬编码"的不对称。 */
   windowSec: () => number;
+  onStateChange?: (state: 'running' | 'degraded') => void;
   log?: (msg: string) => void;
 }
 
 export interface Companion {
   stop(): void;
+  /** List persisted interactive threads, newest first. */
+  listThreads(query: CodexThreadListQuery): Promise<CodexThreadPage>;
+  /** Restore an archived thread so it can be resumed by a quoted IM reply. */
+  unarchiveThread(threadId: string): Promise<void>;
   /** Reopen a persisted thread, then start a turn or steer its active turn. */
   resume(threadId: string, input: string): Promise<void>;
+}
+
+export type CodexThreadStatus =
+  | { type: 'notLoaded' | 'idle' | 'systemError' }
+  | { type: 'active'; activeFlags: Array<'waitingOnApproval' | 'waitingOnUserInput'> };
+
+export interface CodexThreadSummary {
+  id: string;
+  preview: string;
+  cwd: string;
+  createdAt: number;
+  updatedAt: number;
+  recencyAt?: number;
+  status: CodexThreadStatus;
+  name?: string;
+}
+
+export interface CodexThreadListQuery {
+  cursor?: string;
+  limit: number;
+  archived: boolean;
+  searchTerm?: string;
+}
+
+export interface CodexThreadPage {
+  threads: CodexThreadSummary[];
+  nextCursor?: string;
 }
 
 export const threadKey = (threadId: string): string => `codex:${threadId}`;
@@ -53,6 +85,13 @@ export function startCompanion(deps: CompanionDeps): Companion {
   // and one notified turn per thread so either event order still yields one card.
   const latestErrors = new Map<string, { turnId: string; message: string }>();
   const notifiedFailures = new Map<string, string>();
+  type ApprovalResponse = { decision: 'accept' | 'decline' };
+  type ApprovalReplay = {
+    responders: Set<(result: unknown) => void>;
+    result?: ApprovalResponse;
+    settled?: boolean;
+  };
+  const approvalReplays = new Map<string, ApprovalReplay>();
   // Threads we've already (attempted to) resume on the current connection.
   // Cleared on disconnect — a reconnect doesn't preserve app-server subscriptions.
   let resumed = new Set<string>();
@@ -111,18 +150,24 @@ export function startCompanion(deps: CompanionDeps): Companion {
     return activeTurn?.id as string | undefined;
   }
 
-  function resumeThread(threadId: string, attempt = 1): void {
+  function resumeThread(threadId: string, attempt = 1, force = false): void {
     if (stopped || !rpc) return;
     if (attempt === 1) {
-      if (resumed.has(threadId)) return;
+      if (!force && resumed.has(threadId)) return;
       resumed.add(threadId);
     }
     rpc.call('thread/resume', { threadId }).then(
-      (res) => { captureResume(threadId, res); },
+      (res) => {
+        if (!force) captureResume(threadId, res);
+        else {
+          const cwd = (res as ResumeResult | undefined)?.cwd;
+          if (typeof cwd === 'string' && cwd) threadCwds.set(threadId, cwd);
+        }
+      },
       (err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
         if (/no rollout/i.test(msg) && attempt < RESUME_RETRY_MAX) {
-          const t = setTimeout(() => resumeThread(threadId, attempt + 1), RESUME_RETRY_MS);
+          const t = setTimeout(() => resumeThread(threadId, attempt + 1, force), RESUME_RETRY_MS);
           t.unref?.();
         } else {
           log(`companion: resume ${threadId} failed: ${msg}`);
@@ -139,9 +184,23 @@ export function startCompanion(deps: CompanionDeps): Companion {
       const res = (await rpc.call('thread/loaded/list', {})) as { data?: string[] } | undefined;
       const ids = res?.data ?? [];
       for (const id of ids) resumeThread(id);
+      const listed = await rpc.call('thread/list', {
+        limit: 100,
+        archived: false,
+        sortKey: 'recency_at',
+        sortDirection: 'desc',
+      }) as { data?: unknown } | undefined;
+      if (Array.isArray(listed?.data)) {
+        for (const raw of listed.data) {
+          const thread = readThreadSummary(raw);
+          if (thread?.status.type === 'active' && thread.status.activeFlags.includes('waitingOnApproval')) {
+            resumeThread(thread.id, 1, true);
+          }
+        }
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      log(`companion: thread/loaded/list failed: ${msg}`);
+      log(`companion: thread poll failed: ${msg}`);
     }
   }
 
@@ -211,7 +270,10 @@ export function startCompanion(deps: CompanionDeps): Companion {
       const threadId = (p.threadId as string | undefined) ?? '';
       const item = (p.item ?? {}) as Record<string, unknown>;
       if (threadId && item.type === 'commandExecution') {
-        deps.permissionRouter.cancel({ key: threadKey(threadId), toolName: 'Bash', sessionId: threadId });
+        if (typeof item.id === 'string') {
+          approvalReplays.delete(`${threadId}\0${item.id}`);
+          deps.permissionRouter.cancel({ key: threadKey(threadId), toolName: 'Bash', sessionId: threadId, requestKey: item.id });
+        }
       }
       if (threadId && item.type === 'agentMessage') {
         // An empty agentMessage must not clobber the previous real one — the
@@ -225,6 +287,7 @@ export function startCompanion(deps: CompanionDeps): Companion {
     if (method === 'turn/completed') {
       const threadId = (p.threadId as string | undefined) ?? '';
       if (threadId) {
+        for (const key of approvalReplays.keys()) if (key.startsWith(`${threadId}\0`)) approvalReplays.delete(key);
         const turn = (p.turn ?? {}) as Record<string, unknown>;
         const turnId = (turn.id as string | undefined) ?? '';
         if (turnId && notifiedFailures.get(threadId) === turnId) {
@@ -257,6 +320,9 @@ export function startCompanion(deps: CompanionDeps): Companion {
         lastMessages.delete(threadId);
         latestErrors.delete(threadId);
         notifiedFailures.delete(threadId);
+        for (const replayKey of approvalReplays.keys()) {
+          if (replayKey.startsWith(`${threadId}\0`)) approvalReplays.delete(replayKey);
+        }
         deps.onMonitor({ event: 'session-end', cwd, sessionId: threadId }, key);
         // Thread is done — drop the cached cwd so it can't leak into a stray
         // later event for the same (now-archived) threadId.
@@ -266,10 +332,20 @@ export function startCompanion(deps: CompanionDeps): Companion {
     }
   }
 
-  function handleServerRequest(_id: number | string, method: string, params: unknown, respond: (result: unknown) => void): void {
+  function handleServerRequest(id: number | string, method: string, params: unknown, respond: (result: unknown) => void): void {
     const p = (params ?? {}) as Record<string, unknown>;
     if (method === 'item/commandExecution/requestApproval') {
       const threadId = (p.threadId as string | undefined) ?? '';
+      const itemId = typeof p.itemId === 'string' && p.itemId ? p.itemId : `request:${id}`;
+      const replayKey = `${threadId}\0${itemId}`;
+      const replay = approvalReplays.get(replayKey);
+      if (replay) {
+        if (replay.result) respond(replay.result);
+        else if (!replay.settled) replay.responders.add(respond);
+        return;
+      }
+      const current: ApprovalReplay = { responders: new Set([respond]) };
+      approvalReplays.set(replayKey, current);
       const command = p.command;
       const cwd = p.cwd;
       const reason = p.reason;
@@ -287,13 +363,22 @@ export function startCompanion(deps: CompanionDeps): Companion {
           input: { command, cwd, reason },
           timeoutSec: deps.windowSec(),
           sessionId: threadId,
+          requestKey: itemId,
         })
         .then((r) => {
-          if (r.decision === 'allow') respond({ decision: 'accept' });
-          else if (r.decision === 'deny') respond({ decision: 'decline' });
+          current.settled = true;
+          if (r.decision === 'allow') current.result = { decision: 'accept' };
+          else if (r.decision === 'deny') current.result = { decision: 'decline' };
+          if (current.result) {
+            for (const reply of current.responders) {
+              try { reply(current.result); } catch { /* a replay connection may already be closed */ }
+            }
+          }
+          current.responders.clear();
           // defer / local: never respond — leave pending / already settled elsewhere.
         })
         .catch((err: unknown) => {
+          approvalReplays.delete(replayKey);
           const msg = err instanceof Error ? err.message : String(err);
           log(`approval request failed: ${msg}`);
           // Never respond — approval stays pending, native prompt still governs.
@@ -327,14 +412,17 @@ export function startCompanion(deps: CompanionDeps): Companion {
         rpc = undefined;
         stopPolling();
         resumed = new Set();
+        deps.onStateChange?.('degraded');
         if (!stopped) scheduleReconnect();
       },
     };
     try {
       rpc = await deps.connect(events);
       reconnectDelay = RECONNECT_MIN_MS;
+      deps.onStateChange?.('running');
       await onConnected();
     } catch (err) {
+      deps.onStateChange?.('degraded');
       const msg = err instanceof Error ? err.message : String(err);
       log(`companion: connect failed: ${msg}`);
       scheduleReconnect();
@@ -350,6 +438,27 @@ export function startCompanion(deps: CompanionDeps): Companion {
       stopPolling();
       rpc?.close();
       rpc = undefined;
+    },
+    async listThreads(query: CodexThreadListQuery): Promise<CodexThreadPage> {
+      if (!rpc) throw new Error('companion: not connected');
+      const res = await rpc.call('thread/list', {
+        limit: query.limit,
+        archived: query.archived,
+        sortKey: 'recency_at',
+        sortDirection: 'desc',
+        ...(query.cursor ? { cursor: query.cursor } : {}),
+        ...(query.searchTerm ? { searchTerm: query.searchTerm } : {}),
+      }, 30_000) as { data?: unknown; nextCursor?: unknown } | undefined;
+      return {
+        threads: Array.isArray(res?.data)
+          ? res.data.map(readThreadSummary).filter((t): t is CodexThreadSummary => t !== undefined)
+          : [],
+        ...(typeof res?.nextCursor === 'string' && res.nextCursor ? { nextCursor: res.nextCursor } : {}),
+      };
+    },
+    async unarchiveThread(threadId: string): Promise<void> {
+      if (!rpc) throw new Error('companion: not connected');
+      await rpc.call('thread/unarchive', { threadId });
     },
     async resume(threadId: string, input: string): Promise<void> {
       if (!rpc) throw new Error('companion: not connected');
@@ -377,6 +486,34 @@ export function startCompanion(deps: CompanionDeps): Companion {
         }
       }
     },
+  };
+}
+
+function readThreadSummary(value: unknown): CodexThreadSummary | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const t = value as Record<string, unknown>;
+  if (typeof t.id !== 'string' || !t.id) return undefined;
+  const rawStatus = t.status && typeof t.status === 'object' ? t.status as Record<string, unknown> : {};
+  const type = rawStatus.type;
+  if (type !== 'notLoaded' && type !== 'idle' && type !== 'systemError' && type !== 'active') return undefined;
+  const status: CodexThreadStatus = type === 'active'
+    ? {
+        type,
+        activeFlags: Array.isArray(rawStatus.activeFlags)
+          ? rawStatus.activeFlags.filter((v): v is 'waitingOnApproval' | 'waitingOnUserInput' =>
+              v === 'waitingOnApproval' || v === 'waitingOnUserInput')
+          : [],
+      }
+    : { type };
+  return {
+    id: t.id,
+    preview: typeof t.preview === 'string' ? t.preview : '',
+    cwd: typeof t.cwd === 'string' ? t.cwd : '',
+    createdAt: typeof t.createdAt === 'number' && Number.isFinite(t.createdAt) ? t.createdAt : 0,
+    updatedAt: typeof t.updatedAt === 'number' && Number.isFinite(t.updatedAt) ? t.updatedAt : 0,
+    ...(typeof t.recencyAt === 'number' && Number.isFinite(t.recencyAt) ? { recencyAt: t.recencyAt } : {}),
+    ...(typeof t.name === 'string' && t.name ? { name: t.name } : {}),
+    status,
   };
 }
 

@@ -17,22 +17,22 @@ Approve tool calls, watch runs, take over typing — from Telegram, Feishu, or a
 ## 本仓库
 
 这是基于 tlive `3.0.0` 维护的个人部署版本。目标是让 Codex CLI/App Server
-通过飞书可靠地发送完成、失败和审批通知，并允许从通知卡片引用回复后继续原
-Codex thread。
+通过飞书可靠地发送完成、失败和审批通知，并允许从通知卡片直接输入或引用
+回复后继续原 Codex thread。
 
-当前定制版本：`3.0.0-feishu-codex.2`。
+当前定制版本：`3.0.0-feishu-codex.3`。
 
 ### 定制能力
 
 - 飞书消息和卡片回调统一使用 `open_id`，并限制为配置中的允许用户。
-- 飞书引用回复可恢复原 Codex thread；空闲 turn 使用 `turn/start`，活跃 turn
-  使用 `turn/steer`。
+- 飞书卡片输入框或引用回复可恢复原 Codex thread；空闲 turn 使用
+  `turn/start`，活跃 turn 使用 `turn/steer`。
 - 消息到 Codex thread 的路由持久化，daemon 重启后仍可引用旧卡片继续。
 - 普通文字仅在目标会话唯一时自动路由，多个会话时要求引用目标卡片。
 - Codex `error` 与失败的 `turn/completed` 会生成 `Turn failed` 卡片，显示
   503、模型容量不足等错误原文；自动重试中的中间错误不会制造重复通知。
-- 引用失败卡片回复“继续”会在同一 thread 新建 turn，不会删除历史、回滚文件
-  或重放上一轮。
+- 在失败卡片输入“继续”或引用回复，会在同一 thread 新建 turn，不会删除历
+  史、回滚文件或重放上一轮。
 
 ### 开发与部署
 
@@ -368,9 +368,11 @@ frozen surface (locked by `tests/contract/`); `mode` and the runtime toggles
 IM commands: `/mute on|off` (silence IM notifications), `/trust on|off` (pause
 approvals — auto-allow everything), `/safe on|off` (auto-allow routine ops),
 `/mode off|notify|full|all` (set posture; a bare `/mode` replies with the
-ladder), `/help`. Tapping a bare command from the client's command menu
-replies with on/off buttons instead of an error. Quote-reply any session
-message to type into that session.
+ladder), `/sessions [search]` (page, search and select current or historical
+Codex threads; use `/sessions archived [search]` for archived threads), and
+`/help`. Tapping a bare command from the client's command menu replies with
+on/off buttons instead of an error. Feishu continuation cards provide an
+inline input; other channels can quote-reply a session message.
 
 ## Config (`~/.tlive/config.json`)
 

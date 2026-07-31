@@ -176,6 +176,20 @@ describe('PermissionRouter web-only gate + cancel + per-request timeout', () => 
     expect((await p2).decision).toBe('local');
   });
 
+  it('requestKey prevents a completed sibling command from cancelling the waiting approval', async () => {
+    const r = new PermissionRouter(base({ configuredChats: () => [], hasWebClients: () => true }));
+    const waiting = r.requestPermission({ key: '/w', cwd: '/w', toolName: 'Bash', input: {}, sessionId: 's1', requestKey: 'item-waiting' });
+    const fast = r.requestPermission({ key: '/w', cwd: '/w', toolName: 'Bash', input: {}, sessionId: 's1', requestKey: 'item-fast' });
+    await new Promise((res) => setImmediate(res));
+
+    expect(r.cancel({ key: '/w', toolName: 'Bash', sessionId: 's1', requestKey: 'item-fast' })).toBe(1);
+    expect((await fast).decision).toBe('local');
+    expect(r.pendingCount()).toBe(1);
+
+    expect(r.cancel({ key: '/w', toolName: 'Bash', sessionId: 's1', requestKey: 'item-waiting' })).toBe(1);
+    expect((await waiting).decision).toBe('local');
+  });
+
   it('cancel does not cross sessions or sub-agents sharing key+tool', async () => {
     // 两个子 agent(同 key 同 tool 不同 agentId)各有一张 pending 卡:
     // 本地答掉 agent A 的对话框,不得误伤 agent B 的卡。

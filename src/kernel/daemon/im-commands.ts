@@ -1,6 +1,6 @@
 // src/kernel/daemon/im-commands.ts
 //
-// IM command set: /mute, /trust, /safe, /help. Each earns its place by being
+// IM command set: /mute, /trust, /safe, /mode, /sessions, /help. Each earns its place by being
 // something you'd actually fire FROM the phone. `/mute on` = go quiet, `/mute
 // off` = notifications back on (polarity matches /trust /safe: "on" = that mode
 // engaged). It governs IM notifications ONLY — desktop toasts are independent,
@@ -28,6 +28,7 @@ export type ImCommand =
   /** Bare /mode (menu tap) or an unknown level → show the ladder with a button
    *  per rung, same explicit-choice rule as toggle-prompt. */
   | { kind: 'mode-prompt' }
+  | { kind: 'sessions'; archived: boolean; searchTerm?: string }
   | { kind: 'help' }
   | { kind: 'unknown'; name: string };
 
@@ -54,6 +55,11 @@ export function parseImCommand(text: string): ImCommand | null {
       return { kind: 'toggle-prompt', which: 'safe' };
     case 'mode':
       return MODES.includes(arg as ShimMode) ? { kind: 'mode', mode: arg as ShimMode } : { kind: 'mode-prompt' };
+    case 'sessions': {
+      const archived = arg?.toLowerCase() === 'archived';
+      const searchTerm = (archived ? args.slice(1) : args).join(' ').trim();
+      return { kind: 'sessions', archived, ...(searchTerm ? { searchTerm } : {}) };
+    }
     case 'help':
       return { kind: 'help' };
     default:

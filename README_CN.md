@@ -256,9 +256,10 @@ tlive hook <event>     hook shim(Claude Code 调用,不是给你用的;
 
 IM 命令:`/mute on|off`(静音 IM 通知)、`/trust on|off`(暂停审批——全部
 自动放行)、`/safe on|off`(自动放行日常操作)、`/mode off|notify|full|all`
-(设置姿态;裸发 `/mode` 会回梯子卡)、`/help`。在客户端命令菜单里点一下裸
-命令,会回一组 on/off 按钮而不是报错。引用任意会话消息回复 = 打字进那个
-会话。
+(设置姿态;裸发 `/mode` 会回梯子卡)、`/sessions [关键词]`(分页查看、搜索并
+选择当前/历史 Codex thread;`/sessions archived [关键词]` 查看归档)、
+`/help`。在客户端命令菜单里点一下裸命令,会回一组 on/off 按钮而不是报错。
+飞书续跑卡可直接在卡片输入框继续；其他通道可引用会话消息回复。
 
 ## 配置(`~/.tlive/config.json`)
 

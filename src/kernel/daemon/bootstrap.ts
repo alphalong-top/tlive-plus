@@ -26,10 +26,11 @@ import { EventHub } from '../web/event-hub.js';
 import { applyMonitorEvent, sweepDeadSessions, pidAlive } from '../web/session-events.js';
 import { ensureCodexAppServer, codexAppServerSockPath } from '../codex/spawn.js';
 import { connectCodexRpc } from '../codex/rpc.js';
-import { startCompanion, type Companion } from '../codex/companion.js';
+import { startCompanion, type CodexThreadListQuery, type CodexThreadPage, type Companion } from '../codex/companion.js';
 import { excerptForCard } from './excerpt.js';
 import { TURN_FINISHED_SENTINEL, effectiveMode, type ShimMode } from '../hook/normalizer.js';
 import { writeMode } from '../config/mode.js';
+import { BUILD_ID } from '../build-id.js';
 
 export interface DaemonHandle {
   shutdown(): Promise<void>;
@@ -170,12 +171,10 @@ export function createMessageRouteStore(path: string): {
 /** 续跑卡 body:成功摘录进 expandable 引用块；失败错误直接显示。
  *  body 前导 \n 是有意的 —— renderCard 只在 title 后放一个换行,这一个
  *  额外换行就是标题与正文之间的那道留白。 */
-export function buildContinueCardBody(lastMessage: string, failed = false): string {
+export function buildContinueCardBody(lastMessage: string, failed = false, includeReplyHint = true): string {
   const ex = excerptForCard(lastMessage ?? '');
   const quote = ex ? (failed ? `${ex}\n\n` : ex.split('\n').map((l) => `>! ${l}`).join('\n') + '\n\n') : '';
-  // Quote-reply is the continue path (the on-card input box was removed) — the
-  // hint spells it out because quote-reply is not obvious, esp. on Feishu.
-  return `\n${quote}*Reply to this message to continue.*`;
+  return `\n${quote}${includeReplyHint ? '*Reply to this message to continue.*' : ''}`.trimEnd();
 }
 
 /** One structured line per diagnostic event, on the daemon's stdout (captured to
@@ -408,7 +407,7 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
 
   const sendToChat = async (
     target: PermChat,
-    msg: { title?: string; body?: string; text?: string; requestId?: string; toolName?: string; cwd?: string; ask?: AskContext; agentId?: string; buttons?: Array<{ id: string; label: string }>; onSent?: (s: { channel: string; messageId: string }) => void },
+    msg: { title?: string; body?: string; text?: string; requestId?: string; toolName?: string; cwd?: string; ask?: AskContext; agentId?: string; buttons?: Array<{ id: string; label: string }>; inputAction?: { id: string; placeholder: string; submitLabel: string }; onSent?: (s: { channel: string; messageId: string }) => void },
   ): Promise<void> => {
     const adapter = (opts.imAdapters ?? []).find((a) => a.channel === target.channel);
     if (!adapter) return;
@@ -456,7 +455,7 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
               ] : []),
             ],
         } : {}),
-        ...(msg.ask && msg.requestId ? (() => {
+        ...(msg.inputAction ? { inputAction: msg.inputAction } : msg.ask && msg.requestId ? (() => {
           // Channels with a native input (Feishu form) get ONE submit. multi →
           // the form submit IS the Submit (id = asksubmit:<rid>): typed text
           // and ticked boxes travel together, no second button (live feedback:
@@ -763,6 +762,20 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
   // key → cancel-grace:一个会话在续跑 grace 窗口内时,收到该会话的新 prompt
   // 就调用它取消发卡(用户在键盘前继续了)。
   const continueGrace = new Map<string, () => void>();
+  type ContinueCard = { requestId: string; messageId?: string; title: string; body: string; channel: string; adapter?: IMAdapter };
+  const latestContinueCards = new Map<string, ContinueCard>();
+
+  const retireContinueCard = async (card: ContinueCard): Promise<void> => {
+    if (!card.messageId || !card.adapter) return;
+    try {
+      await card.adapter.edit(card.messageId, { kind: 'card', title: card.title, body: card.body });
+    } catch (e) {
+      logJson('continue-card.retire-failed', {
+        channel: card.channel,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  };
 
   continueBroker.onRequest((req) => {
     // Thread the continue requestId into the session so a dashboard client can reply to it.
@@ -776,14 +789,33 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
     for (const t of configuredChats()) {
       // requestId 不进显示文本:回复路由走 replyToMessageId,不解析正文。
       const raw = req.context === TURN_FINISHED_SENTINEL ? '' : req.context;
+      const title = req.failed ? 'Turn failed' : 'Turn finished';
+      const body = buildContinueCardBody(raw, req.failed, t.channel !== 'feishu');
+      const adapter = (opts.imAdapters ?? []).find((a) => a.channel === t.channel);
+      const cardKey = `${req.cwd}\u0000${t.channel}\u0000${t.chatId}`;
+      const current: ContinueCard = {
+        requestId: req.requestId,
+        title: `${sessionTag(req.cwd)}${title}`,
+        body,
+        channel: t.channel,
+        ...(adapter ? { adapter } : {}),
+      };
+      if (t.channel === 'feishu') {
+        const previous = latestContinueCards.get(cardKey);
+        latestContinueCards.set(cardKey, current);
+        if (previous) void retireContinueCard(previous);
+      }
       void sendToChat(t, {
-        title: req.failed ? 'Turn failed' : 'Turn finished',
-        body: buildContinueCardBody(raw, req.failed),
+        title,
+        body,
         cwd: req.cwd,
-        // No on-card input box: continuing a turn is done by quote-replying to
-        // this card (inbound-handler routes a reply → the session's pending
-        // continueId). The empty form + redundant Continue button read as
-        // clutter; TG never rendered it anyway (quote-reply was always its path).
+        ...(t.channel === 'feishu' ? {
+          inputAction: { id: `continue:${req.requestId}`, placeholder: 'Message this session', submitLabel: 'Continue' },
+          onSent: (sent) => {
+            if (latestContinueCards.get(cardKey) === current) current.messageId = sent.messageId;
+            else void retireContinueCard({ ...current, messageId: sent.messageId });
+          },
+        } : {}),
       });
     }
   });
@@ -801,6 +833,12 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
   // Indirection: onResumePrompt is needed at construction time, but resume()
   // only exists once startCompanion returns — close over this instead.
   let codexResume: (threadId: string, input: string) => Promise<void> = async () => {
+    throw new Error('Codex app-server is unavailable');
+  };
+  let codexListThreads: (query: CodexThreadListQuery) => Promise<CodexThreadPage> = async () => {
+    throw new Error('Codex app-server is unavailable');
+  };
+  let codexUnarchiveThread: (threadId: string) => Promise<void> = async () => {
     throw new Error('Codex app-server is unavailable');
   };
   const onCodexResumePrompt = makeCodexResumeHandler({
@@ -825,9 +863,12 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
       },
       onResumePrompt: onCodexResumePrompt,
       windowSec: () => approvalWindow(cfg.approvals).timeoutSec,
+      onStateChange: (s) => { codexState = s; },
       log: (m) => console.log(`[codex] ${m}`),
     });
     codexResume = (threadId, input) => codexCompanion!.resume(threadId, input);
+    codexListThreads = (query) => codexCompanion!.listThreads(query);
+    codexUnarchiveThread = (threadId) => codexCompanion!.unarchiveThread(threadId);
   }
 
   // Upstream actions from a dashboard client (/ws/events): approve/ask/reply/mute.
@@ -962,7 +1003,7 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
       logJson('ipc.request', { kind: req.kind, callerPid: ctx.callerPid ?? null, ...idOf(req) });
       switch (req.kind) {
         case 'daemon.status':
-          reply({ kind: 'daemon.status', uptimeMs: Date.now() - startedAt, pid: process.pid, codex: codexState });
+          reply({ kind: 'daemon.status', uptimeMs: Date.now() - startedAt, pid: process.pid, buildId: BUILD_ID, codex: codexState });
           return;
         case 'daemon.stop':
           reply({ kind: 'daemon.stopped' });
@@ -1273,6 +1314,9 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
       ...(s.continueId ? { continueId: s.continueId } : {}),
       ...(s.id.startsWith('codex:') ? { codexThreadId: s.id.slice('codex:'.length) } : {}),
     })),
+    listCodexThreads: (query) => codexListThreads(query),
+    unarchiveCodexThread: (threadId) => codexUnarchiveThread(threadId),
+    rememberSessionMessage: rememberMsg,
     inject: (sockPath, text) => injectInput(sockPath, text),
     sendCodex: (threadId, text) => codexResume(threadId, text),
     findLiveCard,
@@ -1307,6 +1351,8 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
       permissionRouter.settleAllPending();
       continueBroker.settleAllPending();
       await new Promise((r) => setImmediate(r));
+      await Promise.all([...latestContinueCards.values()].map(retireContinueCard));
+      latestContinueCards.clear();
       codexCompanion?.stop();
       custody?.stop();
       for (const a of opts.imAdapters ?? []) await a.stop();

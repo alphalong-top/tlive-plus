@@ -118,6 +118,7 @@ interface PendingEntry {
   resolve: (d: { decision: Decision; message?: string; updatedInput?: unknown }) => void;
   key: string;
   toolName: string;
+  requestKey?: string;
   sessionId?: string;
   agentId?: string;
 }
@@ -144,11 +145,12 @@ export class PermissionRouter {
    *  Keeping them as two required, separate fields is the whole point of this
    *  split — collapsing them back into one is the bug (see bootstrap.ts's
    *  resolveKey doc comment). */
-  async requestPermission(opts: { key: string; cwd: string; toolName: string; input: unknown; permissionMode?: string; timeoutSec?: number; sessionId?: string; agentId?: string; onAbandoned?: (cb: () => void) => void }): Promise<{ decision: Decision; message?: string; updatedInput?: unknown }> {
+  async requestPermission(opts: { key: string; cwd: string; toolName: string; input: unknown; permissionMode?: string; timeoutSec?: number; requestKey?: string; sessionId?: string; agentId?: string; onAbandoned?: (cb: () => void) => void }): Promise<{ decision: Decision; message?: string; updatedInput?: unknown }> {
     // Identity only — the tool input can carry secrets and never goes to the log.
     const who = {
       key: opts.key,
       toolName: opts.toolName,
+      ...(opts.requestKey ? { requestKey: opts.requestKey } : {}),
       ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
       ...(opts.agentId ? { agentId: opts.agentId } : {}),
     };
@@ -202,6 +204,7 @@ export class PermissionRouter {
         resolve,
         key: opts.key,
         toolName: opts.toolName,
+        ...(opts.requestKey !== undefined ? { requestKey: opts.requestKey } : {}),
         ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
         ...(opts.agentId ? { agentId: opts.agentId } : {}),
       });
@@ -363,15 +366,16 @@ export class PermissionRouter {
   /** The user answered in the local terminal (PostToolUse / PermissionDenied /
    *  UserPromptSubmit / Stop observed) — release matching pending shims.
    *  `toolName` omitted = every pending request for the key.
-   *  sessionId:双方都带才比较,缺失 = 通配。
+   *  requestKey:带值时必须精确匹配;sessionId:双方都带才比较,缺失 = 通配。
    *  matchAgent 三态:undefined = 任意 agent(prompt/stop 清场);null = 仅主
    *  会话的卡(回答者是主会话,不得误放子 agent 的同 tool 卡);字符串 = 仅该
    *  agent 的卡。Never auto-allows —— 释放只是 {} pass-through。 */
-  cancel(opts: { key: string; toolName?: string; sessionId?: string; matchAgent?: string | null }): number {
+  cancel(opts: { key: string; toolName?: string; requestKey?: string; sessionId?: string; matchAgent?: string | null }): number {
     let n = 0;
     for (const [rid, e] of [...this.pending]) {
       if (e.key !== opts.key) continue;
       if (opts.toolName !== undefined && e.toolName !== opts.toolName) continue;
+      if (opts.requestKey !== undefined && e.requestKey !== opts.requestKey) continue;
       if (!fieldMatches(e.sessionId, opts.sessionId)) continue;
       if (opts.matchAgent !== undefined && e.agentId !== (opts.matchAgent ?? undefined)) continue;
       this.pending.delete(rid);

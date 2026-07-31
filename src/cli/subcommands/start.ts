@@ -5,22 +5,33 @@ import { homedir } from 'node:os';
 import { defaultSocketPath, request } from '../../kernel/ipc/client.js';
 import { printWebBanner } from '../web-url.js';
 import { spawnDaemonDetached, daemonEntryPath } from '../../kernel/daemon/spawn.js';
+import { waitUntilSocketFree } from '../../kernel/ipc/server.js';
+import { isCurrentBuild } from '../../kernel/build-id.js';
 
 export async function runStart(argv: string[]): Promise<void> {
   const home = process.env.TLIVE_HOME ?? join(homedir(), '.tlive');
   const sockPath = defaultSocketPath();
   const foreground = argv.includes('--foreground') || argv.includes('-F');
 
-  // already running?
+  // A replaced global package can leave the old in-memory daemon serving IM.
+  // Missing buildId means a pre-fingerprint daemon, so the first upgrade also restarts.
+  let running: Awaited<ReturnType<typeof request>> | undefined;
   try {
-    const r = await request({ kind: 'daemon.status' }, { socketPath: sockPath, timeoutMs: 1000 });
-    if (r.kind === 'daemon.status') {
-      process.stdout.write(`tlive daemon already running (pid ${r.pid})\n\ntlive web UI:\n`);
+    running = await request({ kind: 'daemon.status' }, { socketPath: sockPath, timeoutMs: 1000 });
+  } catch {
+    // Not running; continue to spawn.
+  }
+  if (running?.kind === 'daemon.status') {
+    if (isCurrentBuild(running.buildId)) {
+      process.stdout.write(`tlive daemon already running (pid ${running.pid})\n\ntlive web UI:\n`);
       await printWebBanner(home);
       return;
     }
-  } catch {
-    // not running, continue
+    process.stdout.write(`tlive daemon build changed; restarting pid ${running.pid}\n`);
+    await request({ kind: 'daemon.stop' }, { socketPath: sockPath, timeoutMs: 4000 });
+    if (!(await waitUntilSocketFree(sockPath, 8000, 200))) {
+      throw new Error('old daemon did not stop after a build update');
+    }
   }
 
   const daemonEntry = daemonEntryPath();

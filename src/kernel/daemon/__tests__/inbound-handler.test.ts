@@ -13,9 +13,9 @@ const envelope = (over: Partial<IncomingEnvelope> = {}): IncomingEnvelope => ({
   channel: 'telegram', chatId: 'c1', userId: 'u1', messageId: 'm1', text: '', ts: 0, ...over,
 });
 
-function makeAdapter(msgs: Array<{ kind: string; text?: string }>): IMAdapter {
+function makeAdapter(msgs: Array<{ kind: string; text?: string }>, channel: 'telegram' | 'feishu' = 'telegram'): IMAdapter {
   return {
-    channel: 'telegram',
+    channel,
     start: vi.fn().mockResolvedValue(undefined),
     stop: vi.fn().mockResolvedValue(undefined),
     send: vi.fn().mockImplementation((msg) => { msgs.push(msg); return Promise.resolve({ messageId: 'r1' }); }),
@@ -42,6 +42,9 @@ const baseDeps = (over: Partial<InboundHandlerDeps> = {}): InboundHandlerDeps =>
     resolveReply: () => undefined,
     sessionInfo: () => undefined,
     listSessions: () => [],
+    listCodexThreads: vi.fn().mockResolvedValue({ threads: [] }),
+    unarchiveCodexThread: vi.fn().mockResolvedValue(undefined),
+    rememberSessionMessage: vi.fn(),
     inject: vi.fn().mockResolvedValue(undefined),
     sendCodex: vi.fn().mockResolvedValue(undefined),
     findLiveCard: () => null,
@@ -63,6 +66,15 @@ function askFlowWith(entries: Record<string, unknown>): AskFlow {
 
 const ONE = (question: string, ...labels: string[]) => ({ questions: [{ question, options: labels.map((label) => ({ label })) }] });
 const ONE_MULTI = (question: string, ...labels: string[]) => ({ questions: [{ question, multiSelect: true, options: labels.map((label) => ({ label })) }] });
+const THREAD = (id: string, over: Record<string, unknown> = {}) => ({
+  id,
+  preview: `prompt ${id}`,
+  cwd: `/work/${id}`,
+  createdAt: 1_700_000_000,
+  updatedAt: 1_700_000_100,
+  status: { type: 'notLoaded' as const },
+  ...over,
+});
 
 describe('InboundHandler', () => {
   it('approve:<id> answers true, sends no reply', async () => {
@@ -126,7 +138,88 @@ describe('InboundHandler', () => {
     expect(card.body).toContain('`/trust on|off`');
     expect(card.body).toContain('`/safe on|off`');
     expect(card.body).toContain('/mode');
+    expect(card.body).toContain('/sessions');
     expect(card.body).not.toContain('/desktop'); // machine-local, dropped from IM
+  });
+
+  it('/sessions renders searchable Codex history and selecting a thread creates a persistent reply target', async () => {
+    const msgs: Array<{ kind: string; text?: string }> = [];
+    const listCodexThreads = vi.fn().mockResolvedValue({
+      threads: [THREAD('t1', { name: 'Checkout repair', status: { type: 'active', activeFlags: ['waitingOnUserInput'] } })],
+    });
+    const rememberSessionMessage = vi.fn();
+    const h = new InboundHandler(baseDeps({
+      imBy: () => makeAdapter(msgs),
+      listCodexThreads,
+      rememberSessionMessage,
+    }));
+
+    await h.handle(envelope({ text: '/sessions checkout' }));
+    expect(listCodexThreads).toHaveBeenCalledWith({ limit: 6, archived: false, searchTerm: 'checkout' });
+    const card = msgs[0] as unknown as { kind: string; body: string; buttons: Array<{ id: string; label: string }> };
+    expect(card.body).toContain('Checkout repair');
+    expect(card.body).toContain('`input`');
+
+    await h.handle(envelope({ text: card.buttons.find((b) => b.label === '1. Select')!.id }));
+    expect(rememberSessionMessage).toHaveBeenCalledWith('telegram', 'r1', 'codex:t1');
+    expect((msgs[1] as unknown as { title: string }).title).toBe('Codex thread selected');
+  });
+
+  it('/sessions archived restores the selected thread before making it replyable', async () => {
+    const msgs: Array<{ kind: string; text?: string }> = [];
+    const unarchiveCodexThread = vi.fn().mockResolvedValue(undefined);
+    const h = new InboundHandler(baseDeps({
+      imBy: () => makeAdapter(msgs),
+      listCodexThreads: vi.fn().mockResolvedValue({ threads: [THREAD('old')] }),
+      unarchiveCodexThread,
+    }));
+
+    await h.handle(envelope({ text: '/sessions archived' }));
+    const card = msgs[0] as unknown as { buttons: Array<{ id: string; label: string }> };
+    await h.handle(envelope({ text: card.buttons.find((b) => b.label === '1. Restore')!.id }));
+    expect(unarchiveCodexThread).toHaveBeenCalledWith('old');
+    expect((msgs[1] as unknown as { title: string }).title).toBe('Codex thread restored');
+    await h.handle(envelope({ text: card.buttons.find((b) => b.label === '1. Restore')!.id }));
+    expect(unarchiveCodexThread).toHaveBeenCalledTimes(1);
+    expect((msgs[2] as unknown as { title: string }).title).toBe('Codex thread selected');
+  });
+
+  it('/sessions selected thread gets a persistent Feishu input action', async () => {
+    const msgs: Array<{ kind: string; text?: string }> = [];
+    const h = new InboundHandler(baseDeps({
+      imBy: () => makeAdapter(msgs, 'feishu'),
+      listCodexThreads: vi.fn().mockResolvedValue({ threads: [THREAD('t1')] }),
+    }));
+
+    await h.handle(envelope({ channel: 'feishu', text: '/sessions' }));
+    const list = msgs[0] as unknown as { buttons: Array<{ id: string; label: string }> };
+    await h.handle(envelope({ channel: 'feishu', text: list.buttons[0].id }));
+
+    expect(msgs[1]).toMatchObject({
+      kind: 'card',
+      inputAction: { id: 'codexinput:t1', submitLabel: 'Continue' },
+    });
+    expect((msgs[1] as unknown as { body: string }).body).not.toContain('Quote-reply');
+  });
+
+  it('session history pagination edits the existing card and keeps a working Previous cursor', async () => {
+    const msgs: Array<{ kind: string; text?: string }> = [];
+    const adapter = makeAdapter(msgs);
+    const listCodexThreads = vi.fn()
+      .mockResolvedValueOnce({ threads: [THREAD('first')], nextCursor: 'cursor-2' })
+      .mockResolvedValueOnce({ threads: [THREAD('second')] })
+      .mockResolvedValueOnce({ threads: [THREAD('first')], nextCursor: 'cursor-2' });
+    const h = new InboundHandler(baseDeps({ imBy: () => adapter, listCodexThreads }));
+
+    await h.handle(envelope({ text: '/sessions' }));
+    const first = msgs[0] as unknown as { buttons: Array<{ id: string; label: string }> };
+    await h.handle(envelope({ text: first.buttons.find((b) => b.label === 'Next')!.id, messageId: 'list-card' }));
+    expect(listCodexThreads).toHaveBeenNthCalledWith(2, { limit: 6, archived: false, cursor: 'cursor-2' });
+    expect(adapter.edit).toHaveBeenCalledWith('list-card', expect.objectContaining({ kind: 'card' }));
+
+    const second = vi.mocked(adapter.edit).mock.calls[0][1] as Extract<OutgoingMessage, { kind: 'card' }>;
+    await h.handle(envelope({ text: second.buttons!.find((b) => b.label === 'Previous')!.id, messageId: 'list-card' }));
+    expect(listCodexThreads).toHaveBeenNthCalledWith(3, { limit: 6, archived: false });
   });
 
   it('/mute on mutes, /mute off unmutes (on = quiet)', async () => {
@@ -656,6 +749,29 @@ describe('native input box submits (Feishu form → formText)', () => {
     await h.handle(envelope({ text: 'askinput:req-1', formText: 'and email' }));
     expect((answers[0].updatedInput as { answers: Record<string, string> }).answers['Channels?']).toBe('Feishu, and email');
     expect(askFlow.peek('req-1')).toBeUndefined(); // consumed
+  });
+
+  it('continue:<rid> sends the typed text through the live broker', async () => {
+    const answer = vi.fn().mockReturnValue(true);
+    const msgs: Array<{ kind: string; text?: string }> = [];
+    const h = new InboundHandler(baseDeps({
+      imBy: () => makeAdapter(msgs, 'feishu'),
+      continueBroker: { answer, request: vi.fn(), onRequest: vi.fn() } as unknown as ContinueBroker,
+    }));
+
+    await h.handle(envelope({ channel: 'feishu', text: 'continue:req-1', formText: 'run the tests' }));
+
+    expect(answer).toHaveBeenCalledWith('req-1', 'run the tests');
+    expect(msgs).toEqual([expect.objectContaining({ text: 'Sent to session' })]);
+  });
+
+  it('codexinput:<thread> resumes that historical thread directly', async () => {
+    const sendCodex = vi.fn().mockResolvedValue(undefined);
+    const h = new InboundHandler(baseDeps({ sendCodex }));
+
+    await h.handle(envelope({ channel: 'feishu', text: 'codexinput:thread-old', formText: 'continue here' }));
+
+    expect(sendCodex).toHaveBeenCalledWith('thread-old', 'continue here');
   });
 
 });

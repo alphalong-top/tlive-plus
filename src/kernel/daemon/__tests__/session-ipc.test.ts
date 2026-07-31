@@ -6,16 +6,20 @@ import { tmpdir } from 'node:os';
 import { bootstrapDaemon, type DaemonHandle } from '../bootstrap';
 import { request, daemonSocketPath } from '../../ipc/client';
 import type { SessionMeta } from '../../ipc/protocol';
-import type { IMAdapter, OutgoingMessage } from '../../contracts/im-adapter';
+import type { IMAdapter, IMChannel, OutgoingMessage } from '../../contracts/im-adapter';
 import { until } from '../../__tests__/wait.js';
 import { writeMode } from '../../config/mode.js';
 
-const recordingAdapter = (sent: OutgoingMessage[]): IMAdapter => ({
-  channel: 'telegram',
+const recordingAdapter = (
+  sent: OutgoingMessage[],
+  channel: IMChannel = 'telegram',
+  edits: Array<{ messageId: string; message: OutgoingMessage }> = [],
+): IMAdapter => ({
+  channel,
   start: async () => {},
   stop: async () => {},
   send: async (o) => { sent.push(o); return { messageId: `m${sent.length}` }; },
-  edit: async () => {},
+  edit: async (messageId, message) => { edits.push({ messageId, message }); },
   onInbound: () => {},
   isConnected: () => 'connected',
 });
@@ -183,8 +187,8 @@ describe('parent-session teardown must be agent-scoped (backgrounded sub-agent a
   });
 });
 
-describe('continuation card has no on-card input box (quote-reply is the entry)', () => {
-  it('the "Turn finished" card send carries no inputAction (form box removed)', async () => {
+describe('continuation card channel inputs', () => {
+  it('keeps Telegram on quote-reply without an inputAction', async () => {
     writeFileSync(join(tmp, 'config.json'), JSON.stringify({
       adapters: { telegram: { token: 't', chatIdAllowList: ['c1'] } },
       approvals: { continueGraceSec: 0, continueWindowSec: 30 },
@@ -201,5 +205,53 @@ describe('continuation card has no on-card input box (quote-reply is the entry)'
       expect(card).toBeTruthy();
       expect((card as { inputAction?: unknown }).inputAction).toBeUndefined();
     });
+  });
+
+  it('adds an inline Continue form on Feishu', async () => {
+    writeFileSync(join(tmp, 'config.json'), JSON.stringify({
+      adapters: { feishu: { appId: 'a', appSecret: 's', chatId: 'c1' } },
+      approvals: { continueGraceSec: 0, continueWindowSec: 30 },
+    }));
+    const sent: OutgoingMessage[] = [];
+    h = await bootstrapDaemon({ home: tmp, imAdapters: [recordingAdapter(sent, 'feishu')] });
+
+    request({ kind: 'hook.continue.request', cwd: '/proj', sessionId: 'sess', context: 'All green.' }, { socketPath: sock, timeoutMs: 300 }).catch(() => undefined);
+
+    await until(() => {
+      const card = sent.find((m) => m.kind === 'card' && (m.title ?? '').includes('Turn finished'));
+      expect(card).toMatchObject({
+        kind: 'card',
+        inputAction: { placeholder: 'Message this session', submitLabel: 'Continue' },
+      });
+      expect((card as { body?: string }).body).not.toContain('Reply to this message');
+    });
+  });
+
+  it('retires the previous Feishu input when the same session gets a newer continue card', async () => {
+    writeFileSync(join(tmp, 'config.json'), JSON.stringify({
+      adapters: { feishu: { appId: 'a', appSecret: 's', chatId: 'c1' } },
+      approvals: { continueGraceSec: 0, continueWindowSec: 30 },
+    }));
+    const sent: OutgoingMessage[] = [];
+    const edits: Array<{ messageId: string; message: OutgoingMessage }> = [];
+    h = await bootstrapDaemon({ home: tmp, imAdapters: [recordingAdapter(sent, 'feishu', edits)] });
+
+    void h.continueBroker.request({ cwd: 'codex:t1', context: 'First result', timeoutSec: 30 });
+    await until(() => { expect(sent).toHaveLength(1); });
+    void h.continueBroker.request({ cwd: 'codex:t1', context: 'Newer result', timeoutSec: 30 });
+
+    await until(() => {
+      expect(sent).toHaveLength(2);
+      expect(edits).toHaveLength(1);
+    });
+    expect(edits[0].messageId).toBe('m1');
+    expect(edits[0].message).toMatchObject({ kind: 'card', body: expect.stringContaining('First result') });
+    expect((edits[0].message as { inputAction?: unknown }).inputAction).toBeUndefined();
+    expect((sent[1] as { inputAction?: unknown }).inputAction).toBeDefined();
+
+    await h.shutdown();
+    expect(edits).toHaveLength(2);
+    expect(edits[1].messageId).toBe('m2');
+    expect((edits[1].message as { inputAction?: unknown }).inputAction).toBeUndefined();
   });
 });

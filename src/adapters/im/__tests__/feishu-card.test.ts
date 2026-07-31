@@ -153,6 +153,17 @@ describe('feishu buildCard (schema 2.0)', () => {
     });
   });
 
+  it('uses a compact single-line input for session continuation', () => {
+    const card = buildCard({
+      kind: 'card',
+      title: 'demo · Turn finished',
+      body: 'All green.',
+      inputAction: { id: 'continue:r1', placeholder: 'Message this session', submitLabel: 'Continue' },
+    }) as Card2;
+    const form = card.body.elements.find((e) => e.tag === 'form') as { elements: Array<Record<string, unknown>> };
+    expect(form.elements[0]).toMatchObject({ tag: 'input', name: 'reply', input_type: 'text', required: false });
+  });
+
   it('makes the reply box required on a single-select ask — typing IS the answer there', () => {
     const card = buildCard({
       kind: 'card', title: 'y · Question', body: 'Pick one',

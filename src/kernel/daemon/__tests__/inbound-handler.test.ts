@@ -765,6 +765,43 @@ describe('native input box submits (Feishu form → formText)', () => {
     expect(msgs).toEqual([expect.objectContaining({ text: 'Sent to session' })]);
   });
 
+  it('stale continue:<rid> resumes its persisted Codex thread after a daemon restart', async () => {
+    const sendCodex = vi.fn().mockResolvedValue(undefined);
+    const msgs: Array<{ kind: string; text?: string }> = [];
+    const h = new InboundHandler(baseDeps({
+      imBy: () => makeAdapter(msgs, 'feishu'),
+      resolveReply: (channel, messageId) => channel === 'feishu' && messageId === 'old-card' ? 'codex:thread-old' : undefined,
+      sessionInfo: (key) => key === 'codex:thread-old'
+        ? { kind: 'hook', label: 'Codex', codexThreadId: 'thread-old' }
+        : undefined,
+      sendCodex,
+    }));
+
+    await h.handle(envelope({
+      channel: 'feishu',
+      messageId: 'old-card',
+      text: 'continue:expired-after-restart',
+      formText: 'continue here',
+    }));
+
+    expect(sendCodex).toHaveBeenCalledWith('thread-old', 'continue here');
+    expect(msgs).toEqual([expect.objectContaining({ text: 'Sent to [Codex]' })]);
+  });
+
+  it('stale continue:<rid> without a persisted Codex route does not guess a target', async () => {
+    const sendCodex = vi.fn();
+    const msgs: Array<{ kind: string; text?: string }> = [];
+    const h = new InboundHandler(baseDeps({
+      imBy: () => makeAdapter(msgs, 'feishu'),
+      sendCodex,
+    }));
+
+    await h.handle(envelope({ channel: 'feishu', text: 'continue:unknown', formText: 'continue here' }));
+
+    expect(sendCodex).not.toHaveBeenCalled();
+    expect(msgs).toEqual([expect.objectContaining({ text: STALE_CARD_NOTICE })]);
+  });
+
   it('codexinput:<thread> resumes that historical thread directly', async () => {
     const sendCodex = vi.fn().mockResolvedValue(undefined);
     const h = new InboundHandler(baseDeps({ sendCodex }));

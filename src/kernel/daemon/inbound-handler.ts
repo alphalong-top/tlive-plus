@@ -315,7 +315,16 @@ export class InboundHandler {
         if (this.deps.continueBroker.answer(continuation[1], env.formText)) {
           await this.reply(env, { kind: 'text', text: 'Sent to session' });
         } else {
-          await this.reply(env, { kind: 'text', text: STALE_CARD_NOTICE });
+          // Continue tokens live only in the daemon, but the card-to-thread
+          // route is persisted. After a restart, resume the exact Codex thread
+          // named by that card instead of falsely claiming the thread ended.
+          const key = this.deps.resolveReply(env.channel, env.messageId);
+          const session = key ? this.deps.sessionInfo(key) : undefined;
+          if (session?.codexThreadId) {
+            await this.sendToCodex({ ...env, text: env.formText }, session.codexThreadId, session.label);
+          } else {
+            await this.reply(env, { kind: 'text', text: STALE_CARD_NOTICE });
+          }
         }
         return;
       }

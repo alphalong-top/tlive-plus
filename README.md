@@ -20,7 +20,7 @@ Approve tool calls, watch runs, take over typing — from Telegram, Feishu, or a
 通过飞书可靠地发送完成、失败和审批通知，并允许从通知卡片直接输入或引用
 回复后继续原 Codex thread。
 
-当前定制版本：`3.0.0-feishu-codex.4`。
+当前定制版本：`3.0.0-feishu-codex.5`。
 
 ### 定制能力
 

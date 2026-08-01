@@ -1,4 +1,7 @@
-# Getting Started with tlive v2.0
+# Getting Started with tlive-plus
+
+This project is a public fork of [y49/tlive](https://github.com/y49/tlive).
+The commands and behavior in this guide describe this repository.
 
 This guide takes you from zero to a working tlive setup. By the end you'll
 have the daemon running, at least one IM bot connected, live monitoring of
@@ -21,7 +24,11 @@ can answer them from your phone) is opt-in via `tlive mode full`.
 ## Install
 
 ```bash
-npm install -g tlive
+git clone https://github.com/alphalong-top/tlive-plus.git
+cd tlive-plus
+pnpm install
+pnpm run ci
+npm install -g .
 tlive --version
 ```
 
@@ -56,6 +63,13 @@ To re-register plugins only (e.g. after a tlive upgrade):
 ```bash
 tlive setup --hooks-only
 ```
+
+For Codex provider capacity errors (`503 Service Unavailable` or `Selected
+model is at capacity`), this fork automatically waits 60 seconds and sends
+`从中断处继续` to the same thread. Three consecutive terminal failures stop
+the automation and show the normal failure card. A real `agentMessage` resets
+the counter. Configure this under `codex.autoRetry` in
+`~/.tlive/config.json` if needed.
 
 Secure the file:
 
@@ -166,5 +180,5 @@ control returns to the local terminal as if tlive weren't there.
 
 - [CLI command reference](commands.md)
 - Platform setup guides: [Telegram](setup-telegram.md) · [Feishu](setup-feishu.md)
-- [Uninstalling / cleanup + migrating from v0.x/v1](uninstall.md)
+- [Uninstalling / cleanup](uninstall.md)
 - Back to [README.md](../README.md) for architecture overview.

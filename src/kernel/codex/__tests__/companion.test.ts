@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { startCompanion, threadKey } from '../companion';
 
-function harness() {
+function harness(autoRetry: { enabled?: boolean; maxConsecutiveFailures?: number; delaySec?: number } = { enabled: false }) {
   const calls: any[] = [];
   let events: any; // captured CodexRpcEvents wiring via deps.connect
   const rpc = {
@@ -23,6 +23,7 @@ function harness() {
     onMonitor,
     onResumePrompt,
     windowSec: () => 86_400,
+    autoRetry: () => autoRetry,
   });
   return { rpc, router, onMonitor, onResumePrompt, comp, calls, getEvents: () => events, setEvents: (e: any) => { events = e; } };
 }
@@ -377,6 +378,54 @@ describe('companion', () => {
     events.onNotify('turn/completed', { threadId: 't1', turn: { id: 'turn-2', status: 'failed', error } });
     events.onNotify('error', { threadId: 't1', turnId: 'turn-2', willRetry: false, error });
     expect(onResumePrompt).toHaveBeenCalledTimes(2);
+    comp.stop();
+  });
+
+  it('automatically sends a continuation prompt after a retryable failure and stops at the limit', async () => {
+    const { comp, rpc, getEvents, onResumePrompt } = harness({ enabled: true, maxConsecutiveFailures: 3, delaySec: 60 });
+    await vi.runOnlyPendingTimersAsync();
+    await Promise.resolve();
+    await Promise.resolve();
+    const events = getEvents();
+    const error = { message: 'unexpected status 503 Service Unavailable' };
+
+    events.onNotify('error', { threadId: 't1', turnId: 'turn-1', willRetry: false, error });
+    expect(onResumePrompt).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(rpc.call).not.toHaveBeenCalledWith('turn/start', expect.objectContaining({ input: [{ type: 'text', text: '从中断处继续' }] }));
+    await vi.advanceTimersByTimeAsync(1);
+    await Promise.resolve();
+    expect(rpc.call).toHaveBeenCalledWith('turn/start', { threadId: 't1', input: [{ type: 'text', text: '从中断处继续' }] });
+
+    events.onNotify('error', { threadId: 't1', turnId: 'turn-2', willRetry: false, error });
+    await vi.advanceTimersByTimeAsync(60_000);
+    await Promise.resolve();
+    events.onNotify('error', { threadId: 't1', turnId: 'turn-3', willRetry: false, error });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(onResumePrompt).toHaveBeenCalledWith({ threadId: 't1', key: 'codex:t1', error: error.message });
+    expect(onResumePrompt).toHaveBeenCalledTimes(1);
+    expect(rpc.call.mock.calls.filter(([method, params]) =>
+      method === 'turn/start' && params.input?.[0]?.text === '从中断处继续')).toHaveLength(2);
+    comp.stop();
+  });
+
+  it('normal agent output, including a partial delta, clears failures and cancels the pending retry', async () => {
+    const { comp, rpc, getEvents, onResumePrompt } = harness({ enabled: true, maxConsecutiveFailures: 3, delaySec: 60 });
+    await vi.runOnlyPendingTimersAsync();
+    await Promise.resolve();
+    await Promise.resolve();
+    const events = getEvents();
+    const error = { message: 'Selected model is at capacity. Please try a different model.' };
+
+    events.onNotify('error', { threadId: 't1', turnId: 'turn-1', willRetry: false, error });
+    events.onNotify('item/agentMessage/delta', { threadId: 't1', delta: '正常回复了几句' });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(rpc.call).not.toHaveBeenCalledWith('turn/start', expect.objectContaining({ input: [{ type: 'text', text: '从中断处继续' }] }));
+
+    events.onNotify('error', { threadId: 't1', turnId: 'turn-2', willRetry: false, error });
+    events.onNotify('item/completed', { threadId: 't1', item: { type: 'agentMessage', text: '再次正常回复' } });
+    events.onNotify('error', { threadId: 't1', turnId: 'turn-3', willRetry: false, error });
+    expect(onResumePrompt).not.toHaveBeenCalled();
     comp.stop();
   });
 

@@ -1,12 +1,12 @@
 <div align="center">
 
-# tlive
+# tlive-plus
 
-**厂商中立、自托管:给 `claude` / `codex` 的远程审批 + 实时监看层。**
+**[y49/tlive](https://github.com/y49/tlive) 的公开 fork。** 本仓库为 `tlive-plus`；以下安装、开发、部署和功能说明均以本仓库代码为准。
+厂商中立、自托管:给 `claude` / `codex` 的远程审批 + 实时监看层。
 在手机、飞书或 web 终端上批准工具调用、监看运行、接管打字。
 
-[![npm version](https://img.shields.io/npm/v/tlive)](https://www.npmjs.com/package/tlive)
-[![CI](https://github.com/y49/tlive/actions/workflows/ci.yml/badge.svg)](https://github.com/y49/tlive/actions/workflows/ci.yml)
+[![CI](https://github.com/alphalong-top/tlive-plus/actions/workflows/ci.yml/badge.svg)](https://github.com/alphalong-top/tlive-plus/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 [English](README.md) · [简体中文](README_CN.md)
@@ -22,19 +22,21 @@
 > 卡住任何工具调用)。想开**远程审批**——hold 住每个工具调用、让你在手机上
 > 允许/拒绝——一条命令:**`tlive mode full`**(或让 `tlive setup` 帮你开)。
 
-> [!WARNING]
-> **v2.0 是彻底重写,breaking,无迁移。** tlive 不再是 v1.x 及更早的 Agent-SDK
-> IM *桥接*:它不再驱动/拥有你的会话,旧的桥接模型、它的配置 schema、它的命令
-> (`workspace`、`/use`、chat 绑定……)**均已删除、不再支持**。别把旧的
-> `~/.tlive` 配置沿用过来——直接重跑 `tlive setup`。最后一个 SDK-桥接版本保留在
-> git tag `v1.0-sdk-bridge`。
+> [!NOTE]
+> `tlive-plus` 在本地运行你的 `claude` / `codex` 进程，通过随包插件或 Codex
+> app-server companion 上报事件；daemon 不拥有 agent 会话。配置本 fork 时请从新的
+> `~/.tlive/config.json` 开始。
 
 **跳转:** [快速开始](#30-秒跑起来) · [两档集成](#两档集成) · [功能一览](#功能一览) · [安装](#安装走插件不再手写配置) · [Codex companion](#codexapp-server-companion) · [安全模型](#安全模型) · [CLI](#cli) · [配置](#配置tliveconfigjson) · [架构](#架构)
 
 ## 30 秒跑起来
 
 ```bash
-npm install -g tlive
+git clone https://github.com/alphalong-top/tlive-plus.git
+cd tlive-plus
+pnpm install
+pnpm run ci
+npm install -g .
 
 tlive setup        # 向导:先用 Claude Code/Codex 自己的插件管理器注册 tlive
                     # 插件(hooks/skill//tlive:* 命令),再问 IM 凭据——也可以
@@ -168,13 +170,11 @@ Claude Code 插件里打包了 9 个 hook 事件、一个 `tlive` skill(用法/�
 hooks 块和 `hooks.json`,可以直接拷进去。
 
 卸载(`npm uninstall -g tlive`)会尽力用各家 CLI 卸掉插件,并清理残留的旧
-直写 hooks;`~/.tlive` 下的配置和日志保留。完整清理以及**从 v0.x/v1 迁移**
-的步骤见 [docs/uninstall.md](docs/uninstall.md)。
+直写 hooks;`~/.tlive` 下的配置和日志保留。完整清理步骤见
+[docs/uninstall.md](docs/uninstall.md)。
 
-**先从 GitHub 直接尝鲜**(不用等 npm 发布插件):`claude plugin marketplace
-add y49/tlive` 再 `claude plugin install tlive@tlive`,直接从仓库根的
-`marketplace.json` 拉插件(hooks/skill/命令)。引擎本体还是要装:
-`npm i -g tlive`——daemon/CLI 靠它,hooks 调它。
+**从本仓库安装:**按上面的命令构建并全局安装本 fork，其中包含 daemon、CLI 和
+插件；随后运行 `tlive setup` 注册随包插件。
 
 `tlive setup` 在同时检测到 `claude` 和 `codex` 都在 `PATH` 上时会问**装到
 哪**:`[1] Claude Code [2] Codex [3] 都装(默认)`。插件注册永远先于 IM 凭据
@@ -284,6 +284,15 @@ IM 命令:`/mute on|off`(静音 IM 通知)、`/trust on|off`(暂停审批——�
   "daemon": {
     "autoStart": true         // 默认 true;设 false 关闭 session-start 懒启动
   },
+  "codex": {
+    // 仅重试终态的 503 / 模型容量不足。收到实际 agentMessage 会清零计数；
+    // 达到上限后正常发送失败卡片。
+    "autoRetry": {
+      "enabled": true,                 // 默认 true
+      "maxConsecutiveFailures": 3,     // 默认 3；范围 1-10
+      "delaySec": 60                   // 默认 60；范围 10-300 秒
+    }
+  },
   "approvals": {
     // `holdSubagents` 已删除 —— 由 `tlive mode all` 取代(如果你的配置里还有
     // `"holdSubagents": true`:这个键现在是死的,会被静默忽略,想继续 hold
@@ -349,19 +358,13 @@ flowchart LR
 - **daemon 不拥有会话**:只撮合审批/续跑、fan-out pty 字节、服务 web。
 - **冻结面**(由 `tests/contract/` 锁定的契约)见 [KERNEL.md](KERNEL.md)。
 
-## 从 v1.0 升级
-
-v1.0 用 Agent SDK 驱动会话;v2 转向 hook 层(见
-[`docs/changelog-archive.md`](docs/changelog-archive.md))。Breaking、
-无迁移:重跑 `tlive setup`。v1.0 保留在 git tag `v1.0-sdk-bridge`。
-
 ## 开发
 
 ```bash
-git clone https://github.com/y49/tlive
-cd tlive
+git clone https://github.com/alphalong-top/tlive-plus.git
+cd tlive-plus
 pnpm install
-npm run typecheck && npm test && npm run build
+pnpm run ci
 ```
 
 ## 许可

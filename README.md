@@ -1,13 +1,12 @@
 <div align="center">
 
-# tlive-custom
+# tlive-plus
 
-**Private deployment fork of [y49/tlive](https://github.com/y49/tlive).**
+**Public fork of [y49/tlive](https://github.com/y49/tlive).** This repository is maintained as `tlive-plus`; installation, development, deployment, and behavior below refer to this fork.
 Vendor-neutral, self-hosted remote-approval + live-monitoring for `claude` / `codex`.
 Approve tool calls, watch runs, take over typing — from Telegram, Feishu, or a web terminal.
 
-[![npm version](https://img.shields.io/npm/v/tlive)](https://www.npmjs.com/package/tlive)
-[![CI](https://github.com/y49/tlive/actions/workflows/ci.yml/badge.svg)](https://github.com/y49/tlive/actions/workflows/ci.yml)
+[![CI](https://github.com/alphalong-top/tlive-plus/actions/workflows/ci.yml/badge.svg)](https://github.com/alphalong-top/tlive-plus/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 [English](README.md) · [简体中文](README_CN.md)
@@ -16,11 +15,11 @@ Approve tool calls, watch runs, take over typing — from Telegram, Feishu, or a
 
 ## 本仓库
 
-这是基于 tlive `3.0.0` 维护的个人部署版本。目标是让 Codex CLI/App Server
+这是基于 [y49/tlive](https://github.com/y49/tlive) 的公开 fork。目标是让 Codex CLI/App Server
 通过飞书可靠地发送完成、失败和审批通知，并允许从通知卡片直接输入或引用
 回复后继续原 Codex thread。
 
-当前定制版本：`3.0.0-feishu-codex.6`。
+当前实现和版本以本仓库代码与发布记录为准。
 
 ### 定制能力
 
@@ -33,6 +32,9 @@ Approve tool calls, watch runs, take over typing — from Telegram, Feishu, or a
   503、模型容量不足等错误原文；自动重试中的中间错误不会制造重复通知。
 - 在失败卡片输入“继续”或引用回复，会在同一 thread 新建 turn，不会删除历
   史、回滚文件或重放上一轮。
+- Codex 遇到 `503 Service Unavailable` 或 `Selected model is at capacity` 时，
+  默认等待 60 秒后自动发送“从中断处继续”；连续 3 次都没有正常回复才停止，
+  中间收到有效 `agentMessage` 会清零连续失败计数并取消待发送重试。
 
 ### 开发与部署
 
@@ -54,17 +56,6 @@ tlive start
 tlive status
 ```
 
-### 同步上游
-
-`origin` 指向本仓库，`upstream` 指向官方 `y49/tlive`：
-
-```bash
-git fetch upstream
-git merge upstream/main
-pnpm run ci
-git push origin main
-```
-
 飞书凭证、允许用户和消息路由均位于 `~/.tlive/`，不得复制进仓库。仓库中不应
 包含 `App ID`、`App Secret`、`Chat ID`、用户 `open_id` 或 Web dashboard token。
 
@@ -83,20 +74,22 @@ git push origin main
 > hold each tool call so you can Allow/Deny it from your phone — with one
 > command: **`tlive mode full`** (or let `tlive setup` offer it).
 
-> [!WARNING]
-> **v2.0 is a ground-up rewrite — breaking, with no migration.** tlive is no
-> longer the Agent-SDK IM *bridge* of v1.x and earlier: it no longer drives or
-> owns your sessions, and the old bridge model, its config schema, and its
-> commands (`workspace`, `/use`, chat-binding, …) are **gone and unsupported**.
-> Don't try to carry an old `~/.tlive` config forward — just run `tlive setup`
-> fresh. The final SDK-bridge release is preserved at git tag `v1.0-sdk-bridge`.
+> [!NOTE]
+> `tlive-plus` runs your local `claude` / `codex` process and reports through
+> the bundled plugin or Codex app-server companion. The daemon does not own
+> agent sessions. Start from a fresh `~/.tlive/config.json` when configuring
+> this fork.
 
 **Jump to:** [Quick start](#30-seconds-to-running) · [Integration levels](#the-two-integration-levels) · [Features](#whats-in-the-box) · [Install](#install-plugins-not-config-writes) · [Codex companion](#codex-the-app-server-companion) · [Security](#security-model) · [CLI](#cli) · [Config](#config-tliveconfigjson) · [Architecture](#architecture)
 
 ## 30 seconds to running
 
 ```bash
-npm install -g tlive
+git clone https://github.com/alphalong-top/tlive-plus.git
+cd tlive-plus
+pnpm install
+pnpm run ci
+npm install -g .
 
 tlive setup        # wizard: registers the tlive plugin with Claude Code's/
                     # Codex's own plugin manager (hooks, skill, /tlive:*
@@ -261,14 +254,12 @@ hand.
 
 Uninstalling (`npm uninstall -g tlive`) best-effort removes the plugin via
 each vendor's CLI and cleans up any leftover direct-write hooks; your
-`~/.tlive` config and logs are preserved. Full purge and **migrating from
-v0.x/v1** steps: [docs/uninstall.md](docs/uninstall.md).
+`~/.tlive` config and logs are preserved. Full purge steps:
+[docs/uninstall.md](docs/uninstall.md).
 
-**Try it from GitHub first** (no npm publish needed): `claude plugin
-marketplace add y49/tlive` then `claude plugin install tlive@tlive` pulls
-the plugin (hooks/skill/commands) straight from the repo's root
-`marketplace.json`. You still need the engine itself — `npm i -g tlive` —
-for the daemon/CLI the hooks call into.
+**Install this fork from source:** use the quick-start commands above. They
+build and globally install this repository, including the daemon, CLI, and
+bundled plugins; then run `tlive setup` to register those bundled plugins.
 
 `tlive setup` asks **which vendor(s)** to install the plugin into when it
 detects both `claude` and `codex` on `PATH`: `[1] Claude Code [2] Codex
@@ -398,6 +389,15 @@ inline input; other channels can quote-reply a session message.
   "daemon": {
     "autoStart": true         // default true; false disables session-start lazy-start
   },
+  "codex": {
+    // Retry only terminal 503 / model-capacity failures. A real agentMessage
+    // resets the counter; at the limit tlive sends the normal failure card.
+    "autoRetry": {
+      "enabled": true,                 // default true
+      "maxConsecutiveFailures": 3,     // default 3; allowed range 1-10
+      "delaySec": 60                   // default 60; allowed range 10-300
+    }
+  },
   "approvals": {
     // `holdSubagents` was removed — `tlive mode all` replaces it (upgrading
     // from a config with `"holdSubagents": true`: that key is now dead and
@@ -477,20 +477,13 @@ flowchart LR
 - The **frozen surface** (contracts locked by `tests/contract/`) is documented
   in [KERNEL.md](KERNEL.md).
 
-## Upgrading from v1.0
-
-v1.0 drove sessions via the Agent SDK; v2.0 is the hook layer (see
-[`docs/changelog-archive.md`](docs/changelog-archive.md)). Breaking, no
-migration: re-run `tlive setup`. v1.0 is preserved at git tag
-`v1.0-sdk-bridge`.
-
 ## Development
 
 ```bash
-git clone https://github.com/y49/tlive
-cd tlive
+git clone https://github.com/alphalong-top/tlive-plus.git
+cd tlive-plus
 pnpm install
-npm run typecheck && npm test && npm run build
+pnpm run ci
 ```
 
 ## License

@@ -17,6 +17,8 @@ export interface CompanionDeps {
   onResumePrompt: (p: { threadId: string; key: string; lastMessage?: string; error?: string }) => void;
   /** 远程审批窗口(秒),与 CC 共用 approvals.windowSec —— 消除"一家可配一家硬编码"的不对称。 */
   windowSec: () => number;
+  /** Temporary provider failures resume the same thread with a continuation prompt. */
+  autoRetry?: () => { enabled?: boolean; maxConsecutiveFailures?: number; delaySec?: number } | undefined;
   onStateChange?: (state: 'running' | 'degraded') => void;
   log?: (msg: string) => void;
 }
@@ -73,6 +75,11 @@ const RECONNECT_MAX_MS = 30_000;
 // 0.144.4 binary) — so an approval raised inside the window is answerable
 // the moment the next poll subscribes us, not lost to native-only.
 const POLL_MS = 5_000;
+const AUTO_RETRY_PROMPT = '从中断处继续';
+
+function isRetryableProviderError(message: string): boolean {
+  return /\b503\b.*\bservice unavailable\b|selected model is at capacity/i.test(message);
+}
 
 export function startCompanion(deps: CompanionDeps): Companion {
   let stopped = false;
@@ -81,6 +88,9 @@ export function startCompanion(deps: CompanionDeps): Companion {
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   let pollTimer: ReturnType<typeof setInterval> | undefined;
   const lastMessages = new Map<string, string>();
+  const retryFailures = new Map<string, number>();
+  const retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const retryTurns = new Map<string, string>();
   // App-server normally emits `error` before `turn/completed`; keep one error
   // and one notified turn per thread so either event order still yields one card.
   const latestErrors = new Map<string, { turnId: string; message: string }>();
@@ -106,6 +116,24 @@ export function startCompanion(deps: CompanionDeps): Companion {
   const cwdOf = (threadId: string): string => threadCwds.get(threadId) ?? threadKey(threadId);
 
   const log = deps.log ?? (() => undefined);
+
+  function cancelAutoRetry(threadId: string): void {
+    const timer = retryTimers.get(threadId);
+    if (timer) clearTimeout(timer);
+    retryTimers.delete(threadId);
+    retryTurns.delete(threadId);
+  }
+
+  function retryConfig(): { enabled: boolean; maxConsecutiveFailures: number; delayMs: number } {
+    const config = deps.autoRetry?.();
+    const maxFailures = Number.isFinite(config?.maxConsecutiveFailures) ? config!.maxConsecutiveFailures! : 3;
+    const delaySec = Number.isFinite(config?.delaySec) ? config!.delaySec! : 60;
+    return {
+      enabled: config?.enabled !== false,
+      maxConsecutiveFailures: Math.min(Math.max(Math.floor(maxFailures), 1), 10),
+      delayMs: Math.min(Math.max(Math.floor(delaySec), 10), 300) * 1_000,
+    };
+  }
 
   function notifyTurnEnd(threadId: string, error?: string): void {
     deps.permissionRouter.cancel({ key: threadKey(threadId) });
@@ -178,6 +206,62 @@ export function startCompanion(deps: CompanionDeps): Companion {
     );
   }
 
+  async function resume(threadId: string, input: string): Promise<void> {
+    if (!rpc) throw new Error('companion: not connected');
+    const items = [{ type: 'text', text: input }];
+    let activeTurnId = captureResume(threadId, await rpc.call('thread/resume', { threadId }));
+    try {
+      if (activeTurnId) {
+        await rpc.call('turn/steer', { threadId, input: items, expectedTurnId: activeTurnId });
+      } else {
+        await rpc.call('turn/start', { threadId, input: items });
+      }
+    } catch (err) {
+      // The local terminal may start/finish a turn between resume and send.
+      // Refresh once only for that state race; never retry timeouts or other
+      // failures that may already have accepted the input.
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!/active turn|turn.*(?:running|in progress)|no active turn|expectedTurnId|does not match/i.test(msg)) throw err;
+      const refreshed = captureResume(threadId, await rpc.call('thread/resume', { threadId }));
+      if (refreshed && refreshed !== activeTurnId) {
+        await rpc.call('turn/steer', { threadId, input: items, expectedTurnId: refreshed });
+      } else if (!refreshed && activeTurnId) {
+        await rpc.call('turn/start', { threadId, input: items });
+      } else {
+        throw err;
+      }
+    }
+  }
+
+  function retryFailedTurn(threadId: string, turnId: string, message: string): boolean {
+    const config = retryConfig();
+    if (!turnId || !config.enabled || !isRetryableProviderError(message)) return false;
+    if (retryTurns.get(threadId) === turnId) return true;
+    const failures = (retryFailures.get(threadId) ?? 0) + 1;
+    retryFailures.set(threadId, failures);
+    if (failures >= config.maxConsecutiveFailures) return false;
+    cancelAutoRetry(threadId);
+    retryTurns.set(threadId, turnId);
+    const timer = setTimeout(() => {
+      retryTimers.delete(threadId);
+      if (stopped || retryTurns.get(threadId) !== turnId) return;
+      retryTurns.delete(threadId);
+      void resume(threadId, AUTO_RETRY_PROMPT).catch((err: unknown) => {
+        log(`companion: automatic retry ${threadId} failed: ${err instanceof Error ? err.message : String(err)}`);
+        notifyTurnEnd(threadId, message);
+      });
+    }, config.delayMs);
+    timer.unref?.();
+    retryTimers.set(threadId, timer);
+    return true;
+  }
+
+  function reportFailedTurn(threadId: string, turnId: string, message: string): void {
+    if (turnId && notifiedFailures.get(threadId) === turnId) return;
+    if (turnId) notifiedFailures.set(threadId, turnId);
+    if (!retryFailedTurn(threadId, turnId, message)) notifyTurnEnd(threadId, message);
+  }
+
   async function pollThreads(): Promise<void> {
     if (stopped || !rpc) return;
     try {
@@ -234,9 +318,7 @@ export function startCompanion(deps: CompanionDeps): Companion {
       // Intermediate provider failures are retried by Codex itself. Surface
       // only the terminal outcome so a temporary 503 does not create noise.
       if (p.willRetry === true) return;
-      if (turnId && notifiedFailures.get(threadId) === turnId) return;
-      if (turnId) notifiedFailures.set(threadId, turnId);
-      notifyTurnEnd(threadId, message);
+      reportFailedTurn(threadId, turnId, message);
       return;
     }
     if (method === 'thread/started') {
@@ -251,6 +333,7 @@ export function startCompanion(deps: CompanionDeps): Companion {
       const key = threadKey(threadId);
       const cwd = cwdOf(threadId);
       if (item.type === 'userMessage') {
+        cancelAutoRetry(threadId);
         const content = item.content as Array<{ text?: string }> | undefined;
         const prompt = content?.[0]?.text ?? '';
         deps.onMonitor({ event: 'prompt', cwd, sessionId: threadId, prompt }, key);
@@ -264,6 +347,15 @@ export function startCompanion(deps: CompanionDeps): Companion {
       if (!threadId) return;
       const key = threadKey(threadId);
       deps.onMonitor({ event: 'activity', cwd: cwdOf(threadId), sessionId: threadId, toolName: '(turn)', result: {} }, key);
+      return;
+    }
+    if (method === 'item/agentMessage/delta') {
+      const threadId = (p.threadId as string | undefined) ?? '';
+      const delta = (p.delta as string | undefined) ?? '';
+      if (threadId && delta.trim()) {
+        retryFailures.delete(threadId);
+        cancelAutoRetry(threadId);
+      }
       return;
     }
     if (method === 'item/completed') {
@@ -280,7 +372,11 @@ export function startCompanion(deps: CompanionDeps): Companion {
         // continue card's excerpt comes from here, and '' renders as a bare
         // "Reply to continue" with the actual last words lost.
         const text = (item.text as string | undefined) ?? '';
-        if (text.trim()) lastMessages.set(threadId, text);
+        if (text.trim()) {
+          lastMessages.set(threadId, text);
+          retryFailures.delete(threadId);
+          cancelAutoRetry(threadId);
+        }
       }
       return;
     }
@@ -300,8 +396,8 @@ export function startCompanion(deps: CompanionDeps): Companion {
           ? readTurnError(turn.error) ?? (cached && (!turnId || cached.turnId === turnId) ? cached.message : undefined) ?? 'Unknown Codex error'
           : undefined;
         latestErrors.delete(threadId);
-        if (error && turnId) notifiedFailures.set(threadId, turnId);
-        notifyTurnEnd(threadId, error);
+        if (error) reportFailedTurn(threadId, turnId, error);
+        else notifyTurnEnd(threadId);
       }
       return;
     }
@@ -318,6 +414,8 @@ export function startCompanion(deps: CompanionDeps): Companion {
         const key = threadKey(threadId);
         const cwd = cwdOf(threadId);
         lastMessages.delete(threadId);
+        retryFailures.delete(threadId);
+        cancelAutoRetry(threadId);
         latestErrors.delete(threadId);
         notifiedFailures.delete(threadId);
         for (const replayKey of approvalReplays.keys()) {
@@ -436,6 +534,9 @@ export function startCompanion(deps: CompanionDeps): Companion {
       stopped = true;
       if (reconnectTimer) clearTimeout(reconnectTimer);
       stopPolling();
+      for (const timer of retryTimers.values()) clearTimeout(timer);
+      retryTimers.clear();
+      retryTurns.clear();
       rpc?.close();
       rpc = undefined;
     },
@@ -460,32 +561,7 @@ export function startCompanion(deps: CompanionDeps): Companion {
       if (!rpc) throw new Error('companion: not connected');
       await rpc.call('thread/unarchive', { threadId });
     },
-    async resume(threadId: string, input: string): Promise<void> {
-      if (!rpc) throw new Error('companion: not connected');
-      const items = [{ type: 'text', text: input }];
-      let activeTurnId = captureResume(threadId, await rpc.call('thread/resume', { threadId }));
-      try {
-        if (activeTurnId) {
-          await rpc.call('turn/steer', { threadId, input: items, expectedTurnId: activeTurnId });
-        } else {
-          await rpc.call('turn/start', { threadId, input: items });
-        }
-      } catch (err) {
-        // The local terminal may start/finish a turn between resume and send.
-        // Refresh once only for that state race; never retry timeouts or other
-        // failures that may already have accepted the input.
-        const msg = err instanceof Error ? err.message : String(err);
-        if (!/active turn|turn.*(?:running|in progress)|no active turn|expectedTurnId|does not match/i.test(msg)) throw err;
-        const refreshed = captureResume(threadId, await rpc.call('thread/resume', { threadId }));
-        if (refreshed && refreshed !== activeTurnId) {
-          await rpc.call('turn/steer', { threadId, input: items, expectedTurnId: refreshed });
-        } else if (!refreshed && activeTurnId) {
-          await rpc.call('turn/start', { threadId, input: items });
-        } else {
-          throw err;
-        }
-      }
-    },
+    resume,
   };
 }
 

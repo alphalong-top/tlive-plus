@@ -38,13 +38,13 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/y49/tlive.git"
+    "url": "git+https://github.com/alphalong-top/tlive-plus.git"
   },
-  "homepage": "https://github.com/y49/tlive#readme",
+  "homepage": "https://github.com/alphalong-top/tlive-plus#readme",
   "bugs": {
-    "url": "https://github.com/y49/tlive/issues"
+    "url": "https://github.com/alphalong-top/tlive-plus/issues"
   },
-  "author": "y49",
+  "author": "tlive-plus contributors",
   "dependencies": {
     "@grammyjs/runner": "^2.0.3",
     "@grammyjs/transformer-throttler": "^1.2.1",

@@ -1,4 +1,7 @@
-# tlive v2.0 入门指南
+# tlive-plus 入门指南
+
+本项目是 [y49/tlive](https://github.com/y49/tlive) 的公开 fork。
+本指南中的命令和行为均以当前仓库为准。
 
 本指南将带你从零完成 tlive 配置。结束后，你会拥有一个运行中的守护进程、
 至少一个已连接的 IM 机器人、在手机上实时监看 Claude Code / Codex 会话——
@@ -19,7 +22,11 @@
 ## 安装
 
 ```bash
-npm install -g tlive
+git clone https://github.com/alphalong-top/tlive-plus.git
+cd tlive-plus
+pnpm install
+pnpm run ci
+npm install -g .
 tlive --version
 ```
 
@@ -49,6 +56,11 @@ README 的 Codex 一节，没成功时的手动 `/hooks` 兜底也在那里。
 ```bash
 tlive setup --hooks-only
 ```
+
+Codex 遇到 `503 Service Unavailable` 或 `Selected model is at capacity` 时，
+本 fork 默认等待 60 秒，向同一 thread 发送 `从中断处继续`。连续 3 次终态失败
+后会停止自动化并发送正常失败卡片；收到有效 `agentMessage` 会清零计数。
+需要调整时，在 `~/.tlive/config.json` 中配置 `codex.autoRetry`。
 
 保护配置文件权限：
 
@@ -146,5 +158,5 @@ tlive run claude
 - [CLI 命令参考](commands.md)
 - 平台配置指南：[Telegram](setup-telegram-cn.md) ·
   [飞书](setup-feishu-cn.md)
-- [卸载 / 清理 + 从 v0.x/v1 迁移](uninstall.md)
+- [卸载 / 清理](uninstall.md)
 - 返回 [README.md](../README.md) 查看架构概览。

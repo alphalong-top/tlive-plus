@@ -13,6 +13,9 @@ export interface WebConfig {
   port?: number;
 }
 export interface PolicyConfig { autoAllow?: string[]; autoDeny?: string[]; ask?: string[] }
+export interface CodexConfig {
+  autoRetry?: { enabled?: boolean; maxConsecutiveFailures?: number; delaySec?: number };
+}
 
 /** windowSec: 远程审批窗口(秒)。默认 86200(≈24h,clamp 上限)—— CC 的
  *  PermissionRequest hook 与本地对话框并行,不阻塞终端,长窗零成本;窗口越短
@@ -40,6 +43,7 @@ export interface KernelConfig {
   allowedSenders: Array<{ channel: 'telegram' | 'feishu'; userId: string }>;
   adapters: AdapterCreds;
   web?: WebConfig;
+  codex?: CodexConfig;
   policy?: PolicyConfig;
   approvals?: ApprovalsConfig;
   daemon?: { socketPath?: string; healthPort?: number; autoStart?: boolean };

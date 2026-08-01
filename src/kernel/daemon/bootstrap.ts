@@ -863,6 +863,7 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
       },
       onResumePrompt: onCodexResumePrompt,
       windowSec: () => approvalWindow(cfg.approvals).timeoutSec,
+      autoRetry: () => cfg.codex?.autoRetry,
       onStateChange: (s) => { codexState = s; },
       log: (m) => console.log(`[codex] ${m}`),
     });

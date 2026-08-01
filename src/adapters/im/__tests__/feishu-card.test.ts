@@ -117,6 +117,7 @@ describe('feishu buildCard (schema 2.0)', () => {
   it('adds a status icon to card titles from outcome and interaction type', () => {
     const title = (out: Parameters<typeof buildCard>[0]) => (buildCard(out) as Card2).header?.title.content;
     expect(title({ kind: 'card', title: 'demo · Turn finished', body: 'done' })).toBe('✅ demo · Turn finished');
+    expect(title({ kind: 'card', title: 'Sent to [demo]', body: '> done' })).toBe('✅ Sent to [demo]');
     expect(title({ kind: 'card', title: 'demo · Turn failed', body: 'boom' })).toBe('❌ demo · Turn failed');
     expect(title({ kind: 'card', title: 'demo · Bash', body: 'rm x', buttons: [{ id: 'approve:1', label: 'Allow' }] })).toBe('⚠️ demo · Bash');
     expect(title({ kind: 'card', title: 'demo · Question', body: 'Pick', inputAction: { id: 'askinput:1', placeholder: 'Answer', submitLabel: 'Send' } })).toBe('💬 demo · Question');

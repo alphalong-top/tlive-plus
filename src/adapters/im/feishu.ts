@@ -39,7 +39,7 @@ function cardStatusIcon(out: CardMessage): StatusIcon {
   const title = (out.title ?? '').replace(STATUS_PREFIX, '');
   if (/\b(?:failed|failure|denied|rejected|error)\b|\u5931\u8d25|\u9519\u8bef|\u62d2\u7edd/iu.test(title)) return '❌';
   if (/\b(?:timed out|expired|session ended|handed back)\b|\u8fc7\u671f|\u5df2\u7ed3\u675f/iu.test(title)) return '⚠️';
-  if (/\b(?:finished|completed|allowed|approved|answered|restored|selected)\b|\u5b8c\u6210|\u6210\u529f|\u5df2\u653e\u884c|\u5df2\u6062\u590d|\u5df2\u9009\u62e9/iu.test(title)) return '✅';
+  if (/\b(?:sent|finished|completed|allowed|approved|answered|restored|selected)\b|\u5b8c\u6210|\u6210\u529f|\u5df2\u53d1\u9001|\u5df2\u653e\u884c|\u5df2\u6062\u590d|\u5df2\u9009\u62e9/iu.test(title)) return '✅';
   if (out.buttons?.some((b) => b.id.startsWith('approve:') || b.id.startsWith('deny:'))) return '⚠️';
   if (out.ask || out.inputAction) return '💬';
   return 'ℹ️';

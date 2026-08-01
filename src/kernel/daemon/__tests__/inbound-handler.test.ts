@@ -759,10 +759,29 @@ describe('native input box submits (Feishu form → formText)', () => {
       continueBroker: { answer, request: vi.fn(), onRequest: vi.fn() } as unknown as ContinueBroker,
     }));
 
-    await h.handle(envelope({ channel: 'feishu', text: 'continue:req-1', formText: 'run the tests' }));
+    await h.handle(envelope({ channel: 'feishu', text: 'continue:req-1', formText: 'run the tests\nthen deploy' }));
 
-    expect(answer).toHaveBeenCalledWith('req-1', 'run the tests');
-    expect(msgs).toEqual([expect.objectContaining({ text: 'Sent to session' })]);
+    expect(answer).toHaveBeenCalledWith('req-1', 'run the tests\nthen deploy');
+    expect(msgs).toEqual([expect.objectContaining({
+      kind: 'card',
+      title: 'Sent to session',
+      body: '> run the tests\n> then deploy',
+    })]);
+  });
+
+  it('uses a collapsible quote for a long Feishu continuation acknowledgement', async () => {
+    const prompt = Array.from({ length: 9 }, (_, i) => `line ${i + 1}`).join('\n');
+    const msgs: Array<{ kind: string; text?: string }> = [];
+    const h = new InboundHandler(baseDeps({
+      imBy: () => makeAdapter(msgs, 'feishu'),
+      continueBroker: { answer: vi.fn().mockReturnValue(true), request: vi.fn(), onRequest: vi.fn() } as unknown as ContinueBroker,
+    }));
+
+    await h.handle(envelope({ channel: 'feishu', text: 'continue:req-1', formText: prompt }));
+
+    const card = msgs[0] as unknown as Extract<OutgoingMessage, { kind: 'card' }>;
+    expect(card.body).toMatch(/^>! line 1/);
+    expect(card.body).toContain('>! line 9');
   });
 
   it('stale continue:<rid> resumes its persisted Codex thread after a daemon restart', async () => {
@@ -785,7 +804,11 @@ describe('native input box submits (Feishu form → formText)', () => {
     }));
 
     expect(sendCodex).toHaveBeenCalledWith('thread-old', 'continue here');
-    expect(msgs).toEqual([expect.objectContaining({ text: 'Sent to [Codex]' })]);
+    expect(msgs).toEqual([expect.objectContaining({
+      kind: 'card',
+      title: 'Sent to [Codex]',
+      body: '> continue here',
+    })]);
   });
 
   it('stale continue:<rid> without a persisted Codex route does not guess a target', async () => {
@@ -804,11 +827,13 @@ describe('native input box submits (Feishu form → formText)', () => {
 
   it('codexinput:<thread> resumes that historical thread directly', async () => {
     const sendCodex = vi.fn().mockResolvedValue(undefined);
-    const h = new InboundHandler(baseDeps({ sendCodex }));
+    const msgs: Array<{ kind: string; text?: string }> = [];
+    const h = new InboundHandler(baseDeps({ imBy: () => makeAdapter(msgs, 'feishu'), sendCodex }));
 
     await h.handle(envelope({ channel: 'feishu', text: 'codexinput:thread-old', formText: 'continue here' }));
 
     expect(sendCodex).toHaveBeenCalledWith('thread-old', 'continue here');
+    expect(msgs).toEqual([expect.objectContaining({ kind: 'card', title: 'Sent to [Codex thread]', body: '> continue here' })]);
   });
 
 });

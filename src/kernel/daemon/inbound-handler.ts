@@ -14,6 +14,7 @@ import { MODES, MODE_DESC } from '../config/mode.js';
 import type { ShimMode } from '../hook/normalizer.js';
 import { basename } from 'node:path';
 import type { CodexThreadListQuery, CodexThreadPage, CodexThreadSummary } from '../codex/companion.js';
+import { excerptForCard } from './excerpt.js';
 
 export interface InboundHandlerDeps {
   senderGuard: SenderGuard;
@@ -312,14 +313,14 @@ export class InboundHandler {
       }
       const continuation = /^continue:(.+)$/.exec(env.text);
       if (continuation) {
+        const key = this.deps.resolveReply(env.channel, env.messageId);
+        const session = key ? this.deps.sessionInfo(key) : undefined;
         if (this.deps.continueBroker.answer(continuation[1], env.formText)) {
-          await this.reply(env, { kind: 'text', text: 'Sent to session' });
+          await this.replySent(env, session?.label, env.formText);
         } else {
           // Continue tokens live only in the daemon, but the card-to-thread
           // route is persisted. After a restart, resume the exact Codex thread
           // named by that card instead of falsely claiming the thread ended.
-          const key = this.deps.resolveReply(env.channel, env.messageId);
-          const session = key ? this.deps.sessionInfo(key) : undefined;
           if (session?.codexThreadId) {
             await this.sendToCodex({ ...env, text: env.formText }, session.codexThreadId, session.label);
           } else {
@@ -405,7 +406,7 @@ export class InboundHandler {
     // A pending Stop-continue is the official resume path — prefer it over injection.
     // (Attachment-only messages skip this: an empty continue reply is meaningless.)
     if (s.continueId && env.text && this.deps.continueBroker.answer(s.continueId, env.text)) {
-      await this.reply(env, { kind: 'text', text: `Sent to [${s.label}]` });
+      await this.replySent(env, s.label, env.text);
       return true;
     }
     if (s.codexThreadId) {
@@ -424,11 +425,29 @@ export class InboundHandler {
     if (!text) return;
     try {
       await this.deps.sendCodex(threadId, text);
-      await this.reply(env, { kind: 'text', text: `Sent to [${label}]` });
+      await this.replySent(env, label, env.text, env.attachments?.length ?? 0);
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       await this.reply(env, { kind: 'text', text: `[${label}] 发送失败: ${reason.slice(0, 300)}` });
     }
+  }
+
+  private async replySent(env: IncomingEnvelope, label: string | undefined, text: string, attachmentCount = 0): Promise<void> {
+    const target = label ? `[${label}]` : 'session';
+    if (env.channel !== 'feishu') {
+      await this.reply(env, { kind: 'text', text: `Sent to ${target}` });
+      return;
+    }
+
+    const excerpt = excerptForCard(text);
+    const lines = excerpt ? excerpt.split('\n') : [];
+    const quote = lines.map((line) => `${lines.length > 8 ? '>!' : '>'} ${line}`).join('\n');
+    const attachments = attachmentCount ? `${attachmentCount} attachment${attachmentCount === 1 ? '' : 's'} sent.` : '';
+    await this.reply(env, {
+      kind: 'card',
+      title: `Sent to ${target}`,
+      body: [quote, attachments].filter(Boolean).join('\n\n'),
+    });
   }
 
   private async injectTo(env: IncomingEnvelope, sockPath: string, label: string): Promise<void> {

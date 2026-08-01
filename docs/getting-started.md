@@ -65,9 +65,9 @@ tlive setup --hooks-only
 ```
 
 For Codex provider capacity errors (`503 Service Unavailable` or `Selected
-model is at capacity`), this fork automatically waits 60 seconds and sends
-`从中断处继续` to the same thread. Three consecutive terminal failures stop
-the automation and show the normal failure card. A real `agentMessage` resets
+model is at capacity`), this fork sends `从中断处继续` to the same thread up
+to five times. The default delays are 60, 120, 180, 240, and 300 seconds. A
+failure after the fifth retry stops the automation and shows the normal failure card. A real `agentMessage` resets
 the counter. Configure this under `codex.autoRetry` in
 `~/.tlive/config.json` if needed.
 

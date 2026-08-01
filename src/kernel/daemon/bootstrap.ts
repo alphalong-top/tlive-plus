@@ -862,6 +862,21 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
         events.broadcast(applyMonitorEvent(sessions, ev, key));
       },
       onResumePrompt: onCodexResumePrompt,
+      onAutoRetry: ({ key, prompt, attempt, maxAttempts }) => {
+        if (muted || sessions.get(key)?.muted) return;
+        for (const target of configuredChats()) {
+          void sendToChat(target, {
+            title: `Codex auto retry ${attempt}/${maxAttempts}`,
+            body: `› ${prompt}`,
+            cwd: key,
+          }).catch((err: unknown) => {
+            logJson('codex.auto-retry.undelivered', {
+              channel: target.channel,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
+        }
+      },
       windowSec: () => approvalWindow(cfg.approvals).timeoutSec,
       autoRetry: () => cfg.codex?.autoRetry,
       onStateChange: (s) => { codexState = s; },

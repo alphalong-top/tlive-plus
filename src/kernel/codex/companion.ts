@@ -15,10 +15,11 @@ export interface CompanionDeps {
   permissionRouter: Pick<PermissionRouter, 'requestPermission' | 'cancel'>;
   onMonitor: (ev: MonitorEvent, key: string) => void;
   onResumePrompt: (p: { threadId: string; key: string; lastMessage?: string; error?: string }) => void;
+  onAutoRetry?: (p: { threadId: string; key: string; prompt: string; attempt: number; maxAttempts: number }) => void;
   /** 远程审批窗口(秒),与 CC 共用 approvals.windowSec —— 消除"一家可配一家硬编码"的不对称。 */
   windowSec: () => number;
   /** Temporary provider failures resume the same thread with a continuation prompt. */
-  autoRetry?: () => { enabled?: boolean; maxConsecutiveFailures?: number; delaySec?: number } | undefined;
+  autoRetry?: () => { enabled?: boolean; maxAttempts?: number; delaySec?: number; maxConsecutiveFailures?: number } | undefined;
   onStateChange?: (state: 'running' | 'degraded') => void;
   log?: (msg: string) => void;
 }
@@ -88,7 +89,7 @@ export function startCompanion(deps: CompanionDeps): Companion {
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   let pollTimer: ReturnType<typeof setInterval> | undefined;
   const lastMessages = new Map<string, string>();
-  const retryFailures = new Map<string, number>();
+  const retryAttempts = new Map<string, number>();
   const retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const retryTurns = new Map<string, string>();
   // App-server normally emits `error` before `turn/completed`; keep one error
@@ -124,14 +125,15 @@ export function startCompanion(deps: CompanionDeps): Companion {
     retryTurns.delete(threadId);
   }
 
-  function retryConfig(): { enabled: boolean; maxConsecutiveFailures: number; delayMs: number } {
+  function retryConfig(): { enabled: boolean; maxAttempts: number; baseDelayMs: number } {
     const config = deps.autoRetry?.();
-    const maxFailures = Number.isFinite(config?.maxConsecutiveFailures) ? config!.maxConsecutiveFailures! : 3;
+    const configuredMax = config?.maxAttempts ?? config?.maxConsecutiveFailures;
+    const maxAttempts = Number.isFinite(configuredMax) ? configuredMax! : 5;
     const delaySec = Number.isFinite(config?.delaySec) ? config!.delaySec! : 60;
     return {
       enabled: config?.enabled !== false,
-      maxConsecutiveFailures: Math.min(Math.max(Math.floor(maxFailures), 1), 10),
-      delayMs: Math.min(Math.max(Math.floor(delaySec), 10), 300) * 1_000,
+      maxAttempts: Math.min(Math.max(Math.floor(maxAttempts), 1), 10),
+      baseDelayMs: Math.min(Math.max(Math.floor(delaySec), 10), 300) * 1_000,
     };
   }
 
@@ -237,20 +239,29 @@ export function startCompanion(deps: CompanionDeps): Companion {
     const config = retryConfig();
     if (!turnId || !config.enabled || !isRetryableProviderError(message)) return false;
     if (retryTurns.get(threadId) === turnId) return true;
-    const failures = (retryFailures.get(threadId) ?? 0) + 1;
-    retryFailures.set(threadId, failures);
-    if (failures >= config.maxConsecutiveFailures) return false;
+    const attempt = (retryAttempts.get(threadId) ?? 0) + 1;
+    if (attempt > config.maxAttempts) return false;
+    retryAttempts.set(threadId, attempt);
     cancelAutoRetry(threadId);
     retryTurns.set(threadId, turnId);
     const timer = setTimeout(() => {
       retryTimers.delete(threadId);
       if (stopped || retryTurns.get(threadId) !== turnId) return;
       retryTurns.delete(threadId);
-      void resume(threadId, AUTO_RETRY_PROMPT).catch((err: unknown) => {
-        log(`companion: automatic retry ${threadId} failed: ${err instanceof Error ? err.message : String(err)}`);
-        notifyTurnEnd(threadId, message);
-      });
-    }, config.delayMs);
+      void resume(threadId, AUTO_RETRY_PROMPT).then(
+        () => deps.onAutoRetry?.({
+          threadId,
+          key: threadKey(threadId),
+          prompt: AUTO_RETRY_PROMPT,
+          attempt,
+          maxAttempts: config.maxAttempts,
+        }),
+        (err: unknown) => {
+          log(`companion: automatic retry ${threadId} failed: ${err instanceof Error ? err.message : String(err)}`);
+          notifyTurnEnd(threadId, message);
+        },
+      );
+    }, Math.min(config.baseDelayMs * attempt, 300_000));
     timer.unref?.();
     retryTimers.set(threadId, timer);
     return true;
@@ -353,7 +364,7 @@ export function startCompanion(deps: CompanionDeps): Companion {
       const threadId = (p.threadId as string | undefined) ?? '';
       const delta = (p.delta as string | undefined) ?? '';
       if (threadId && delta.trim()) {
-        retryFailures.delete(threadId);
+        retryAttempts.delete(threadId);
         cancelAutoRetry(threadId);
       }
       return;
@@ -374,7 +385,7 @@ export function startCompanion(deps: CompanionDeps): Companion {
         const text = (item.text as string | undefined) ?? '';
         if (text.trim()) {
           lastMessages.set(threadId, text);
-          retryFailures.delete(threadId);
+          retryAttempts.delete(threadId);
           cancelAutoRetry(threadId);
         }
       }
@@ -414,7 +425,7 @@ export function startCompanion(deps: CompanionDeps): Companion {
         const key = threadKey(threadId);
         const cwd = cwdOf(threadId);
         lastMessages.delete(threadId);
-        retryFailures.delete(threadId);
+        retryAttempts.delete(threadId);
         cancelAutoRetry(threadId);
         latestErrors.delete(threadId);
         notifiedFailures.delete(threadId);

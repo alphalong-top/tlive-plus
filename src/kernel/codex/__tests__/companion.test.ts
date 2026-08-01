@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { startCompanion, threadKey } from '../companion';
 
-function harness(autoRetry: { enabled?: boolean; maxConsecutiveFailures?: number; delaySec?: number } = { enabled: false }) {
+function harness(autoRetry: { enabled?: boolean; maxAttempts?: number; delaySec?: number } = { enabled: false }) {
   const calls: any[] = [];
   let events: any; // captured CodexRpcEvents wiring via deps.connect
   const rpc = {
@@ -17,15 +17,17 @@ function harness(autoRetry: { enabled?: boolean; maxConsecutiveFailures?: number
   const router = { requestPermission: vi.fn(async () => ({ decision: 'allow' })), cancel: vi.fn(() => 0) };
   const onMonitor = vi.fn();
   const onResumePrompt = vi.fn();
+  const onAutoRetry = vi.fn();
   const comp = startCompanion({
     connect: async (e: any) => { events = e; return rpc as any; },
     permissionRouter: router as any,
     onMonitor,
     onResumePrompt,
+    onAutoRetry,
     windowSec: () => 86_400,
     autoRetry: () => autoRetry,
   });
-  return { rpc, router, onMonitor, onResumePrompt, comp, calls, getEvents: () => events, setEvents: (e: any) => { events = e; } };
+  return { rpc, router, onMonitor, onResumePrompt, onAutoRetry, comp, calls, getEvents: () => events, setEvents: (e: any) => { events = e; } };
 }
 
 describe('companion', () => {
@@ -381,8 +383,8 @@ describe('companion', () => {
     comp.stop();
   });
 
-  it('automatically sends a continuation prompt after a retryable failure and stops at the limit', async () => {
-    const { comp, rpc, getEvents, onResumePrompt } = harness({ enabled: true, maxConsecutiveFailures: 3, delaySec: 60 });
+  it('retries five times with widening delays, reports each sent prompt, then stops', async () => {
+    const { comp, rpc, getEvents, onResumePrompt, onAutoRetry } = harness({ enabled: true, maxAttempts: 5, delaySec: 60 });
     await vi.runOnlyPendingTimersAsync();
     await Promise.resolve();
     await Promise.resolve();
@@ -396,21 +398,34 @@ describe('companion', () => {
     await vi.advanceTimersByTimeAsync(1);
     await Promise.resolve();
     expect(rpc.call).toHaveBeenCalledWith('turn/start', { threadId: 't1', input: [{ type: 'text', text: '从中断处继续' }] });
+    expect(onAutoRetry).toHaveBeenLastCalledWith({
+      threadId: 't1', key: 'codex:t1', prompt: '从中断处继续', attempt: 1, maxAttempts: 5,
+    });
 
-    events.onNotify('error', { threadId: 't1', turnId: 'turn-2', willRetry: false, error });
-    await vi.advanceTimersByTimeAsync(60_000);
-    await Promise.resolve();
-    events.onNotify('error', { threadId: 't1', turnId: 'turn-3', willRetry: false, error });
-    await vi.advanceTimersByTimeAsync(60_000);
+    for (const [attempt, delay] of [
+      [2, 120_000], [3, 180_000], [4, 240_000], [5, 300_000],
+    ] as const) {
+      events.onNotify('error', { threadId: 't1', turnId: `turn-${attempt}`, willRetry: false, error });
+      await vi.advanceTimersByTimeAsync(delay - 1);
+      expect(onAutoRetry).toHaveBeenCalledTimes(attempt - 1);
+      await vi.advanceTimersByTimeAsync(1);
+      await Promise.resolve();
+      expect(onAutoRetry).toHaveBeenLastCalledWith({
+        threadId: 't1', key: 'codex:t1', prompt: '从中断处继续', attempt, maxAttempts: 5,
+      });
+    }
+
+    events.onNotify('error', { threadId: 't1', turnId: 'turn-6', willRetry: false, error });
     expect(onResumePrompt).toHaveBeenCalledWith({ threadId: 't1', key: 'codex:t1', error: error.message });
     expect(onResumePrompt).toHaveBeenCalledTimes(1);
     expect(rpc.call.mock.calls.filter(([method, params]) =>
-      method === 'turn/start' && params.input?.[0]?.text === '从中断处继续')).toHaveLength(2);
+      method === 'turn/start' && params.input?.[0]?.text === '从中断处继续')).toHaveLength(5);
+    expect(onAutoRetry).toHaveBeenCalledTimes(5);
     comp.stop();
   });
 
   it('normal agent output, including a partial delta, clears failures and cancels the pending retry', async () => {
-    const { comp, rpc, getEvents, onResumePrompt } = harness({ enabled: true, maxConsecutiveFailures: 3, delaySec: 60 });
+    const { comp, rpc, getEvents, onResumePrompt } = harness({ enabled: true, maxAttempts: 5, delaySec: 60 });
     await vi.runOnlyPendingTimersAsync();
     await Promise.resolve();
     await Promise.resolve();

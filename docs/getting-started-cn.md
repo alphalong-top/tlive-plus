@@ -58,8 +58,9 @@ tlive setup --hooks-only
 ```
 
 Codex 遇到 `503 Service Unavailable` 或 `Selected model is at capacity` 时，
-本 fork 默认等待 60 秒，向同一 thread 发送 `从中断处继续`。连续 3 次终态失败
-后会停止自动化并发送正常失败卡片；收到有效 `agentMessage` 会清零计数。
+本 fork 默认最多向同一 thread 发送 5 次 `从中断处继续`，等待时间依次为
+60、120、180、240、300 秒。第 5 次续跑后仍失败才停止并发送正常失败卡片；
+收到有效 `agentMessage` 会清零计数。
 需要调整时，在 `~/.tlive/config.json` 中配置 `codex.autoRetry`。
 
 保护配置文件权限：

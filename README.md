@@ -33,7 +33,8 @@ Approve tool calls, watch runs, take over typing — from Telegram, Feishu, or a
 - 在失败卡片输入“继续”或引用回复，会在同一 thread 新建 turn，不会删除历
   史、回滚文件或重放上一轮。
 - Codex 遇到 `503 Service Unavailable` 或 `Selected model is at capacity` 时，
-  默认等待 60 秒后自动发送“从中断处继续”；连续 3 次都没有正常回复才停止，
+  默认最多自动发送 5 次“从中断处继续”，等待时间依次为 60、120、180、240、
+  300 秒；第 5 次续跑后仍失败才停止，
   中间收到有效 `agentMessage` 会清零连续失败计数并取消待发送重试。
 
 ### 开发与部署
@@ -394,8 +395,8 @@ inline input; other channels can quote-reply a session message.
     // resets the counter; at the limit tlive sends the normal failure card.
     "autoRetry": {
       "enabled": true,                 // default true
-      "maxConsecutiveFailures": 3,     // default 3; allowed range 1-10
-      "delaySec": 60                   // default 60; allowed range 10-300
+      "maxAttempts": 5,                // default 5; allowed range 1-10
+      "delaySec": 60                   // base delay; grows per attempt, capped at 300s
     }
   },
   "approvals": {

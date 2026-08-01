@@ -762,7 +762,7 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
   // key → cancel-grace:一个会话在续跑 grace 窗口内时,收到该会话的新 prompt
   // 就调用它取消发卡(用户在键盘前继续了)。
   const continueGrace = new Map<string, () => void>();
-  type ContinueCard = { requestId: string; messageId?: string; title: string; body: string; channel: string; adapter?: IMAdapter };
+  type ContinueCard = { requestId: string; key: string; messageId?: string; title: string; body: string; channel: string; adapter?: IMAdapter };
   const latestContinueCards = new Map<string, ContinueCard>();
 
   const retireContinueCard = async (card: ContinueCard): Promise<void> => {
@@ -795,6 +795,7 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
       const cardKey = `${req.cwd}\u0000${t.channel}\u0000${t.chatId}`;
       const current: ContinueCard = {
         requestId: req.requestId,
+        key: req.cwd,
         title: `${sessionTag(req.cwd)}${title}`,
         body,
         channel: t.channel,
@@ -1367,7 +1368,11 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
       permissionRouter.settleAllPending();
       continueBroker.settleAllPending();
       await new Promise((r) => setImmediate(r));
-      await Promise.all([...latestContinueCards.values()].map(retireContinueCard));
+      // Codex message routes survive daemon restarts, so their existing Feishu
+      // inputs can safely resume the exact thread after the in-memory token expires.
+      await Promise.all([...latestContinueCards.values()]
+        .filter((card) => !card.key.startsWith('codex:'))
+        .map(retireContinueCard));
       latestContinueCards.clear();
       codexCompanion?.stop();
       custody?.stop();

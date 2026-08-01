@@ -227,7 +227,7 @@ describe('continuation card channel inputs', () => {
     });
   });
 
-  it('retires the previous Feishu input when the same session gets a newer continue card', async () => {
+  it('retires an older Feishu input but preserves the current Codex input across daemon restart', async () => {
     writeFileSync(join(tmp, 'config.json'), JSON.stringify({
       adapters: { feishu: { appId: 'a', appSecret: 's', chatId: 'c1' } },
       approvals: { continueGraceSec: 0, continueWindowSec: 30 },
@@ -249,9 +249,12 @@ describe('continuation card channel inputs', () => {
     expect((edits[0].message as { inputAction?: unknown }).inputAction).toBeUndefined();
     expect((sent[1] as { inputAction?: unknown }).inputAction).toBeDefined();
 
+    void h.continueBroker.request({ cwd: 'claude-session', context: 'Claude result', timeoutSec: 30 });
+    await until(() => { expect(sent).toHaveLength(3); });
+
     await h.shutdown();
     expect(edits).toHaveLength(2);
-    expect(edits[1].messageId).toBe('m2');
+    expect(edits[1].messageId).toBe('m3');
     expect((edits[1].message as { inputAction?: unknown }).inputAction).toBeUndefined();
   });
 });

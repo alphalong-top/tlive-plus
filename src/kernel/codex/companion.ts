@@ -15,7 +15,7 @@ export interface CompanionDeps {
   permissionRouter: Pick<PermissionRouter, 'requestPermission' | 'cancel'>;
   onMonitor: (ev: MonitorEvent, key: string) => void;
   onResumePrompt: (p: { threadId: string; key: string; lastMessage?: string; error?: string }) => void;
-  onAutoRetry?: (p: { threadId: string; key: string; prompt: string; attempt: number; maxAttempts: number }) => void;
+  onAutoRetry?: (p: { threadId: string; key: string; prompt: string; error: string; attempt: number; maxAttempts: number }) => void;
   /** 远程审批窗口(秒),与 CC 共用 approvals.windowSec —— 消除"一家可配一家硬编码"的不对称。 */
   windowSec: () => number;
   /** Temporary provider failures resume the same thread with a continuation prompt. */
@@ -79,7 +79,7 @@ const POLL_MS = 5_000;
 const AUTO_RETRY_PROMPT = '从中断处继续';
 
 function isRetryableProviderError(message: string): boolean {
-  return /\b503\b.*\bservice unavailable\b|selected model is at capacity/i.test(message);
+  return /\b429\b.*\btoo many requests\b|\b502\b.*\bbad gateway\b|\b503\b.*\bservice unavailable\b|selected model is at capacity/i.test(message);
 }
 
 export function startCompanion(deps: CompanionDeps): Companion {
@@ -253,6 +253,7 @@ export function startCompanion(deps: CompanionDeps): Companion {
           threadId,
           key: threadKey(threadId),
           prompt: AUTO_RETRY_PROMPT,
+          error: message,
           attempt,
           maxAttempts: config.maxAttempts,
         }),

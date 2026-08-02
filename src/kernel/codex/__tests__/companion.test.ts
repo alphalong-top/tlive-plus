@@ -383,6 +383,28 @@ describe('companion', () => {
     comp.stop();
   });
 
+  it.each([
+    'exceeded retry limit, last status: 429 Too Many Requests',
+    'unexpected status 502 Bad Gateway',
+    'unexpected status 503 Service Unavailable',
+    'Selected model is at capacity. Please try a different model.',
+  ])('retries a terminal provider failure and reports its reason: %s', async (message) => {
+    const { comp, getEvents, onResumePrompt, onAutoRetry } = harness({ enabled: true, maxAttempts: 1, delaySec: 10 });
+    await vi.runOnlyPendingTimersAsync();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    getEvents().onNotify('error', {
+      threadId: 't1', turnId: 'turn-1', willRetry: false, error: { message },
+    });
+    expect(onResumePrompt).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(onAutoRetry).toHaveBeenCalledWith({
+      threadId: 't1', key: 'codex:t1', prompt: '从中断处继续', error: message, attempt: 1, maxAttempts: 1,
+    });
+    comp.stop();
+  });
+
   it('retries five times with widening delays, reports each sent prompt, then stops', async () => {
     const { comp, rpc, getEvents, onResumePrompt, onAutoRetry } = harness({ enabled: true, maxAttempts: 5, delaySec: 60 });
     await vi.runOnlyPendingTimersAsync();
@@ -399,7 +421,7 @@ describe('companion', () => {
     await Promise.resolve();
     expect(rpc.call).toHaveBeenCalledWith('turn/start', { threadId: 't1', input: [{ type: 'text', text: '从中断处继续' }] });
     expect(onAutoRetry).toHaveBeenLastCalledWith({
-      threadId: 't1', key: 'codex:t1', prompt: '从中断处继续', attempt: 1, maxAttempts: 5,
+      threadId: 't1', key: 'codex:t1', prompt: '从中断处继续', error: error.message, attempt: 1, maxAttempts: 5,
     });
 
     for (const [attempt, delay] of [
@@ -411,7 +433,7 @@ describe('companion', () => {
       await vi.advanceTimersByTimeAsync(1);
       await Promise.resolve();
       expect(onAutoRetry).toHaveBeenLastCalledWith({
-        threadId: 't1', key: 'codex:t1', prompt: '从中断处继续', attempt, maxAttempts: 5,
+        threadId: 't1', key: 'codex:t1', prompt: '从中断处继续', error: error.message, attempt, maxAttempts: 5,
       });
     }
 

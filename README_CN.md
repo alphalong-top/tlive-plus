@@ -285,7 +285,7 @@ IM 命令:`/mute on|off`(静音 IM 通知)、`/trust on|off`(暂停审批——�
     "autoStart": true         // 默认 true;设 false 关闭 session-start 懒启动
   },
   "codex": {
-    // 仅重试终态的 503 / 模型容量不足。收到实际 agentMessage 会清零计数；
+    // 重试终态的 429 / 502 / 503 / 模型容量不足。收到实际 agentMessage 会清零计数；
     // 达到上限后正常发送失败卡片。
     "autoRetry": {
       "enabled": true,                 // 默认 true

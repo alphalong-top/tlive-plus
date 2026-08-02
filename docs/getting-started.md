@@ -64,9 +64,10 @@ To re-register plugins only (e.g. after a tlive upgrade):
 tlive setup --hooks-only
 ```
 
-For Codex provider capacity errors (`503 Service Unavailable` or `Selected
-model is at capacity`), this fork sends `从中断处继续` to the same thread up
-to five times. The default delays are 60, 120, 180, 240, and 300 seconds. A
+For transient Codex provider errors (`429 Too Many Requests`, `502 Bad Gateway`,
+`503 Service Unavailable`, or `Selected model is at capacity`), this fork sends
+`从中断处继续` to the same thread up to five times. Each retry card includes the
+provider error that triggered it. The default delays are 60, 120, 180, 240, and 300 seconds. A
 failure after the fifth retry stops the automation and shows the normal failure card. A real `agentMessage` resets
 the counter. Configure this under `codex.autoRetry` in
 `~/.tlive/config.json` if needed.

@@ -57,8 +57,9 @@ README 的 Codex 一节，没成功时的手动 `/hooks` 兜底也在那里。
 tlive setup --hooks-only
 ```
 
-Codex 遇到 `503 Service Unavailable` 或 `Selected model is at capacity` 时，
-本 fork 默认最多向同一 thread 发送 5 次 `从中断处继续`，等待时间依次为
+Codex 遇到 `429 Too Many Requests`、`502 Bad Gateway`、`503 Service Unavailable`
+或 `Selected model is at capacity` 时，本 fork 默认最多向同一 thread 发送 5 次
+`从中断处继续`；每张重试卡片都会显示触发错误原文，等待时间依次为
 60、120、180、240、300 秒。第 5 次续跑后仍失败才停止并发送正常失败卡片；
 收到有效 `agentMessage` 会清零计数。
 需要调整时，在 `~/.tlive/config.json` 中配置 `codex.autoRetry`。

@@ -29,12 +29,13 @@ Approve tool calls, watch runs, take over typing — from Telegram, Feishu, or a
 - 消息到 Codex thread 的路由持久化，daemon 重启后仍可引用旧卡片继续。
 - 普通文字仅在目标会话唯一时自动路由，多个会话时要求引用目标卡片。
 - Codex `error` 与失败的 `turn/completed` 会生成 `Turn failed` 卡片，显示
-  503、模型容量不足等错误原文；自动重试中的中间错误不会制造重复通知。
+  429/502/503、模型容量不足等错误原文；自动重试中的中间错误不会制造重复通知。
 - 在失败卡片输入“继续”或引用回复，会在同一 thread 新建 turn，不会删除历
   史、回滚文件或重放上一轮。
-- Codex 遇到 `503 Service Unavailable` 或 `Selected model is at capacity` 时，
+- Codex 遇到 `429 Too Many Requests`、`502 Bad Gateway`、
+  `503 Service Unavailable` 或 `Selected model is at capacity` 时，
   默认最多自动发送 5 次“从中断处继续”，等待时间依次为 60、120、180、240、
-  300 秒；第 5 次续跑后仍失败才停止，
+  300 秒；每次重试卡片都会显示触发错误原文，第 5 次续跑后仍失败才停止，
   中间收到有效 `agentMessage` 会清零连续失败计数并取消待发送重试。
 
 ### 开发与部署
@@ -391,7 +392,7 @@ inline input; other channels can quote-reply a session message.
     "autoStart": true         // default true; false disables session-start lazy-start
   },
   "codex": {
-    // Retry only terminal 503 / model-capacity failures. A real agentMessage
+    // Retry terminal 429 / 502 / 503 / model-capacity failures. A real agentMessage
     // resets the counter; at the limit tlive sends the normal failure card.
     "autoRetry": {
       "enabled": true,                 // default true

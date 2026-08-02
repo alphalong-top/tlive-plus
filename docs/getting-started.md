@@ -66,10 +66,10 @@ tlive setup --hooks-only
 
 For transient Codex provider errors (`429 Too Many Requests`, `502 Bad Gateway`,
 `503 Service Unavailable`, or `Selected model is at capacity`), this fork sends
-`从中断处继续` to the same thread up to five times. Each retry card includes the
-provider error that triggered it. The default delays are 60, 120, 180, 240, and 300 seconds. A
-failure after the fifth retry stops the automation and shows the normal failure card. A real `agentMessage` resets
-the counter. Configure this under `codex.autoRetry` in
+`从中断处继续` to the same thread up to three times. Each retry card includes the
+provider error that triggered it. The default delays are 60, 180, and 300 seconds. A
+failure after the third retry stops the automation and shows the normal failure card. A real `agentMessage` resets
+the counter. Configure the schedule under `codex.autoRetry.delaysSec` in
 `~/.tlive/config.json` if needed.
 
 Secure the file:

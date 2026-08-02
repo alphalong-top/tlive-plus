@@ -1380,7 +1380,9 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
       if (web) await web.close();
       await ipc.close();
     } finally {
-      clearTimeout(forceExit);
+      // A real daemon may still have a ref'd SDK handle after clean teardown;
+      // keep its unref'd safety net alive so the process cannot linger.
+      if (process.env.VITEST) clearTimeout(forceExit);
     }
   }
 

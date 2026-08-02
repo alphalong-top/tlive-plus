@@ -19,7 +19,7 @@ export interface CompanionDeps {
   /** 远程审批窗口(秒),与 CC 共用 approvals.windowSec —— 消除"一家可配一家硬编码"的不对称。 */
   windowSec: () => number;
   /** Temporary provider failures resume the same thread with a continuation prompt. */
-  autoRetry?: () => { enabled?: boolean; maxAttempts?: number; delaySec?: number; maxConsecutiveFailures?: number } | undefined;
+  autoRetry?: () => { enabled?: boolean; delaysSec?: number[]; maxAttempts?: number; delaySec?: number; maxConsecutiveFailures?: number } | undefined;
   onStateChange?: (state: 'running' | 'degraded') => void;
   log?: (msg: string) => void;
 }
@@ -77,9 +77,10 @@ const RECONNECT_MAX_MS = 30_000;
 // the moment the next poll subscribes us, not lost to native-only.
 const POLL_MS = 5_000;
 const AUTO_RETRY_PROMPT = '从中断处继续';
+const DEFAULT_RETRY_DELAYS_MS = [60_000, 180_000, 300_000];
 
 function isRetryableProviderError(message: string): boolean {
-  return /\b429\b.*\btoo many requests\b|\b502\b.*\bbad gateway\b|\b503\b.*\bservice unavailable\b|selected model is at capacity/i.test(message);
+  return /\b(?:429|502|503)\b|(?:upstream )?service (?:temporarily )?unavailable|selected model is at capacity/i.test(message);
 }
 
 export function startCompanion(deps: CompanionDeps): Companion {
@@ -125,15 +126,29 @@ export function startCompanion(deps: CompanionDeps): Companion {
     retryTurns.delete(threadId);
   }
 
-  function retryConfig(): { enabled: boolean; maxAttempts: number; baseDelayMs: number } {
+  function retryConfig(): { enabled: boolean; delaysMs: number[] } {
     const config = deps.autoRetry?.();
+    const configuredDelays = Array.isArray(config?.delaysSec)
+      ? config.delaysSec
+        .filter(Number.isFinite)
+        .slice(0, 10)
+        .map((seconds) => Math.min(Math.max(Math.floor(seconds), 10), 300) * 1_000)
+      : undefined;
+    if (configuredDelays?.length) {
+      return { enabled: config?.enabled !== false, delaysMs: configuredDelays };
+    }
     const configuredMax = config?.maxAttempts ?? config?.maxConsecutiveFailures;
-    const maxAttempts = Number.isFinite(configuredMax) ? configuredMax! : 5;
+    const hasLegacyTiming = Number.isFinite(configuredMax) || Number.isFinite(config?.delaySec);
+    if (!hasLegacyTiming) {
+      return { enabled: config?.enabled !== false, delaysMs: DEFAULT_RETRY_DELAYS_MS };
+    }
+    const maxAttempts = Number.isFinite(configuredMax) ? configuredMax! : 3;
     const delaySec = Number.isFinite(config?.delaySec) ? config!.delaySec! : 60;
+    const attempts = Math.min(Math.max(Math.floor(maxAttempts), 1), 10);
+    const baseDelayMs = Math.min(Math.max(Math.floor(delaySec), 10), 300) * 1_000;
     return {
       enabled: config?.enabled !== false,
-      maxAttempts: Math.min(Math.max(Math.floor(maxAttempts), 1), 10),
-      baseDelayMs: Math.min(Math.max(Math.floor(delaySec), 10), 300) * 1_000,
+      delaysMs: Array.from({ length: attempts }, (_, index) => Math.min(baseDelayMs * (index + 1), 300_000)),
     };
   }
 
@@ -209,6 +224,7 @@ export function startCompanion(deps: CompanionDeps): Companion {
   }
 
   async function resume(threadId: string, input: string): Promise<void> {
+    cancelAutoRetry(threadId);
     if (!rpc) throw new Error('companion: not connected');
     const items = [{ type: 'text', text: input }];
     let activeTurnId = captureResume(threadId, await rpc.call('thread/resume', { threadId }));
@@ -240,7 +256,8 @@ export function startCompanion(deps: CompanionDeps): Companion {
     if (!turnId || !config.enabled || !isRetryableProviderError(message)) return false;
     if (retryTurns.get(threadId) === turnId) return true;
     const attempt = (retryAttempts.get(threadId) ?? 0) + 1;
-    if (attempt > config.maxAttempts) return false;
+    const delayMs = config.delaysMs[attempt - 1];
+    if (delayMs === undefined) return false;
     retryAttempts.set(threadId, attempt);
     cancelAutoRetry(threadId);
     retryTurns.set(threadId, turnId);
@@ -255,14 +272,14 @@ export function startCompanion(deps: CompanionDeps): Companion {
           prompt: AUTO_RETRY_PROMPT,
           error: message,
           attempt,
-          maxAttempts: config.maxAttempts,
+          maxAttempts: config.delaysMs.length,
         }),
         (err: unknown) => {
           log(`companion: automatic retry ${threadId} failed: ${err instanceof Error ? err.message : String(err)}`);
           notifyTurnEnd(threadId, message);
         },
       );
-    }, Math.min(config.baseDelayMs * attempt, 300_000));
+    }, delayMs);
     timer.unref?.();
     retryTimers.set(threadId, timer);
     return true;
@@ -398,6 +415,10 @@ export function startCompanion(deps: CompanionDeps): Companion {
         for (const key of approvalReplays.keys()) if (key.startsWith(`${threadId}\0`)) approvalReplays.delete(key);
         const turn = (p.turn ?? {}) as Record<string, unknown>;
         const turnId = (turn.id as string | undefined) ?? '';
+        if (turn.status === 'interrupted') {
+          retryAttempts.delete(threadId);
+          cancelAutoRetry(threadId);
+        }
         if (turnId && notifiedFailures.get(threadId) === turnId) {
           latestErrors.delete(threadId);
           deps.permissionRouter.cancel({ key: threadKey(threadId) });

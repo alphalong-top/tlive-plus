@@ -14,7 +14,7 @@ export interface WebConfig {
 }
 export interface PolicyConfig { autoAllow?: string[]; autoDeny?: string[]; ask?: string[] }
 export interface CodexConfig {
-  autoRetry?: { enabled?: boolean; maxAttempts?: number; delaySec?: number; maxConsecutiveFailures?: number };
+  autoRetry?: { enabled?: boolean; delaysSec?: number[]; maxAttempts?: number; delaySec?: number; maxConsecutiveFailures?: number };
 }
 
 /** windowSec: 远程审批窗口(秒)。默认 86200(≈24h,clamp 上限)—— CC 的

@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { startCompanion, threadKey } from '../companion';
 
-function harness(autoRetry: { enabled?: boolean; maxAttempts?: number; delaySec?: number } = { enabled: false }) {
+function harness(autoRetry: { enabled?: boolean; delaysSec?: number[]; maxAttempts?: number; delaySec?: number } = { enabled: false }) {
   const calls: any[] = [];
   let events: any; // captured CodexRpcEvents wiring via deps.connect
   const rpc = {
@@ -386,6 +386,7 @@ describe('companion', () => {
   it.each([
     'exceeded retry limit, last status: 429 Too Many Requests',
     'unexpected status 502 Bad Gateway',
+    'Upstream service temporarily unavailable',
     'unexpected status 503 Service Unavailable',
     'Selected model is at capacity. Please try a different model.',
   ])('retries a terminal provider failure and reports its reason: %s', async (message) => {
@@ -405,8 +406,8 @@ describe('companion', () => {
     comp.stop();
   });
 
-  it('retries five times with widening delays, reports each sent prompt, then stops', async () => {
-    const { comp, rpc, getEvents, onResumePrompt, onAutoRetry } = harness({ enabled: true, maxAttempts: 5, delaySec: 60 });
+  it('retries three times after 1, 3, and 5 minutes, then stops', async () => {
+    const { comp, rpc, getEvents, onResumePrompt, onAutoRetry } = harness({ enabled: true, delaysSec: [60, 180, 300] });
     await vi.runOnlyPendingTimersAsync();
     await Promise.resolve();
     await Promise.resolve();
@@ -421,11 +422,11 @@ describe('companion', () => {
     await Promise.resolve();
     expect(rpc.call).toHaveBeenCalledWith('turn/start', { threadId: 't1', input: [{ type: 'text', text: '从中断处继续' }] });
     expect(onAutoRetry).toHaveBeenLastCalledWith({
-      threadId: 't1', key: 'codex:t1', prompt: '从中断处继续', error: error.message, attempt: 1, maxAttempts: 5,
+      threadId: 't1', key: 'codex:t1', prompt: '从中断处继续', error: error.message, attempt: 1, maxAttempts: 3,
     });
 
     for (const [attempt, delay] of [
-      [2, 120_000], [3, 180_000], [4, 240_000], [5, 300_000],
+      [2, 180_000], [3, 300_000],
     ] as const) {
       events.onNotify('error', { threadId: 't1', turnId: `turn-${attempt}`, willRetry: false, error });
       await vi.advanceTimersByTimeAsync(delay - 1);
@@ -433,16 +434,16 @@ describe('companion', () => {
       await vi.advanceTimersByTimeAsync(1);
       await Promise.resolve();
       expect(onAutoRetry).toHaveBeenLastCalledWith({
-        threadId: 't1', key: 'codex:t1', prompt: '从中断处继续', error: error.message, attempt, maxAttempts: 5,
+        threadId: 't1', key: 'codex:t1', prompt: '从中断处继续', error: error.message, attempt, maxAttempts: 3,
       });
     }
 
-    events.onNotify('error', { threadId: 't1', turnId: 'turn-6', willRetry: false, error });
+    events.onNotify('error', { threadId: 't1', turnId: 'turn-4', willRetry: false, error });
     expect(onResumePrompt).toHaveBeenCalledWith({ threadId: 't1', key: 'codex:t1', error: error.message });
     expect(onResumePrompt).toHaveBeenCalledTimes(1);
     expect(rpc.call.mock.calls.filter(([method, params]) =>
-      method === 'turn/start' && params.input?.[0]?.text === '从中断处继续')).toHaveLength(5);
-    expect(onAutoRetry).toHaveBeenCalledTimes(5);
+      method === 'turn/start' && params.input?.[0]?.text === '从中断处继续')).toHaveLength(3);
+    expect(onAutoRetry).toHaveBeenCalledTimes(3);
     comp.stop();
   });
 
@@ -463,6 +464,48 @@ describe('companion', () => {
     events.onNotify('item/completed', { threadId: 't1', item: { type: 'agentMessage', text: '再次正常回复' } });
     events.onNotify('error', { threadId: 't1', turnId: 'turn-3', willRetry: false, error });
     expect(onResumePrompt).not.toHaveBeenCalled();
+    comp.stop();
+  });
+
+  it('interrupting a failed turn cancels its pending automatic retry', async () => {
+    const { comp, rpc, getEvents, onAutoRetry } = harness({ enabled: true, delaysSec: [60, 180] });
+    await vi.runOnlyPendingTimersAsync();
+    await Promise.resolve();
+    await Promise.resolve();
+    const events = getEvents();
+    const error = { message: 'unexpected status 503 Service Unavailable' };
+
+    events.onNotify('error', { threadId: 't1', turnId: 'turn-1', willRetry: false, error });
+    events.onNotify('turn/completed', { threadId: 't1', turn: { id: 'turn-1', status: 'interrupted' } });
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(rpc.call).not.toHaveBeenCalledWith('turn/start', expect.objectContaining({
+      input: [{ type: 'text', text: '从中断处继续' }],
+    }));
+    expect(onAutoRetry).not.toHaveBeenCalled();
+    comp.stop();
+  });
+
+  it('manual resume cancels a pending automatic retry', async () => {
+    const { comp, rpc, getEvents, onAutoRetry } = harness({ enabled: true, delaysSec: [60, 180] });
+    await vi.runOnlyPendingTimersAsync();
+    await Promise.resolve();
+    await Promise.resolve();
+    const events = getEvents();
+    events.onNotify('error', {
+      threadId: 't1', turnId: 'turn-1', willRetry: false,
+      error: { message: 'unexpected status 503 Service Unavailable' },
+    });
+
+    await comp.resume('t1', '我自己继续');
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(rpc.call).toHaveBeenCalledWith('turn/start', {
+      threadId: 't1', input: [{ type: 'text', text: '我自己继续' }],
+    });
+    expect(rpc.call.mock.calls.filter(([method, params]) =>
+      method === 'turn/start' && params.input?.[0]?.text === '从中断处继续')).toHaveLength(0);
+    expect(onAutoRetry).not.toHaveBeenCalled();
     comp.stop();
   });
 

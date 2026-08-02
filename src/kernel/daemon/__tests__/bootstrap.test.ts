@@ -48,6 +48,27 @@ describe('daemon bootstrap', () => {
     const r = await request({ kind: 'daemon.status' }, { socketPath: daemonSocketPath(tmp), timeoutMs: 2000 });
     expect(r).toMatchObject({ kind: 'daemon.status', codex: 'off' });
   });
+
+  it('forces a real daemon to exit when an SDK handle survives shutdown', async () => {
+    writeFileSync(join(tmp, 'config.json'), JSON.stringify({ web: { enabled: false } }));
+    h = await bootstrapDaemon({ home: tmp, ensureAppServer: async () => null });
+    const vitest = process.env.VITEST;
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined as never));
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    vi.useFakeTimers();
+    try {
+      delete process.env.VITEST;
+      const shutdown = h.shutdown();
+      await vi.advanceTimersByTimeAsync(2000);
+      await shutdown;
+      expect(exit).toHaveBeenCalledWith(0);
+    } finally {
+      process.env.VITEST = vitest;
+      vi.useRealTimers();
+      exit.mockRestore();
+      error.mockRestore();
+    }
+  });
 });
 
 describe('dual-channel wiring helpers', () => {

@@ -289,8 +289,7 @@ IM 命令:`/mute on|off`(静音 IM 通知)、`/trust on|off`(暂停审批——�
     // 达到上限后正常发送失败卡片。
     "autoRetry": {
       "enabled": true,                 // 默认 true
-      "maxAttempts": 5,                // 默认 5；范围 1-10
-      "delaySec": 60                   // 基础间隔；逐次增加，最长 300 秒
+      "delaysSec": [60, 180, 300]      // 各次重试等待秒数；数组长度即重试次数
     }
   },
   "approvals": {

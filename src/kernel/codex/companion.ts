@@ -80,7 +80,7 @@ const AUTO_RETRY_PROMPT = '从中断处继续';
 const DEFAULT_RETRY_DELAYS_MS = [60_000, 180_000, 300_000];
 
 function isRetryableProviderError(message: string): boolean {
-  return /\b(?:429|502|503)\b|(?:upstream )?service (?:temporarily )?unavailable|selected model is at capacity/i.test(message);
+  return /\b(?:429|502|503)\b|(?:upstream )?service (?:temporarily )?unavailable|selected model is at capacity|stream disconnected before completion|upstream request failed/i.test(message);
 }
 
 export function startCompanion(deps: CompanionDeps): Companion {

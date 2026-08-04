@@ -389,6 +389,7 @@ describe('companion', () => {
     'Upstream service temporarily unavailable',
     'unexpected status 503 Service Unavailable',
     'Selected model is at capacity. Please try a different model.',
+    'stream disconnected before completion: Upstream request failed',
   ])('retries a terminal provider failure and reports its reason: %s', async (message) => {
     const { comp, getEvents, onResumePrompt, onAutoRetry } = harness({ enabled: true, maxAttempts: 1, delaySec: 10 });
     await vi.runOnlyPendingTimersAsync();

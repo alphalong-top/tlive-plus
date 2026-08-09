@@ -2,7 +2,7 @@ import { spawn as nodeSpawn } from 'node:child_process';
 import { connect as netConnect } from 'node:net';
 import { openSync, closeSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { commandOnPath } from '../integrations/hooks-cleanup.js';
 
 export function codexAppServerSockPath(codexHome?: string): string {
@@ -24,6 +24,11 @@ interface ChildLike {
 const FAST_EXIT_MS = 5000;
 const MAX_BACKOFF_MS = 30_000;
 const MAX_FAST_EXITS = 6;
+
+function interactiveShell(): string | undefined {
+  const shell = process.env.SHELL;
+  return shell && ['bash', 'fish', 'zsh'].includes(basename(shell)) ? shell : undefined;
+}
 
 function defaultProbe(sockPath: string): Promise<boolean> {
   return new Promise((resolve) => {
@@ -50,9 +55,13 @@ function defaultProbe(sockPath: string): Promise<boolean> {
 
 function defaultSpawnFn(logPath: string): ChildLike {
   const fd = openSync(logPath, 'a');
-  const child = nodeSpawn('codex', ['app-server', '--listen', 'unix://'], {
+  const shell = interactiveShell();
+  const child = nodeSpawn(shell ?? 'codex', shell
+    ? ['-ic', 'exec codex app-server --listen unix://']
+    : ['app-server', '--listen', 'unix://'], {
     detached: false,
     stdio: ['ignore', fd, fd],
+    ...(shell ? { env: { ...process.env, TERM: process.env.TERM || 'xterm-256color' } } : {}),
   });
   // spawn() 内部已 dup 该 fd 给子进程的 stdout/stderr,子进程持有独立的描述符引用,
   // 父进程这份 fd 用完即可关闭,否则每次 respawn 都会泄漏一个 fd。
@@ -73,7 +82,7 @@ export async function ensureCodexAppServer(opts: {
   hasCodex?: () => boolean;
 }): Promise<AppServerCustody | null> {
   const platform = opts.platform ?? process.platform;
-  const hasCodex = opts.hasCodex ?? (() => commandOnPath('codex'));
+  const hasCodex = opts.hasCodex ?? (() => Boolean(interactiveShell()) || commandOnPath('codex'));
   if (platform === 'win32' || !hasCodex()) return null;
 
   const probe = opts.probe ?? defaultProbe;

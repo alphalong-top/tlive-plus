@@ -6,12 +6,14 @@ const mocks = vi.hoisted(() => ({
   waitUntilSocketFree: vi.fn(),
   spawnDaemonDetached: vi.fn(),
   printWebBanner: vi.fn(),
+  setCodexDesktopSharedEnv: vi.fn(),
 }));
 
 vi.mock('../../../kernel/ipc/client.js', () => ({ defaultSocketPath: () => '/daemon.sock', request: mocks.request }));
 vi.mock('../../../kernel/ipc/server.js', () => ({ waitUntilSocketFree: mocks.waitUntilSocketFree }));
 vi.mock('../../../kernel/daemon/spawn.js', () => ({ daemonEntryPath: () => '/daemon.mjs', spawnDaemonDetached: mocks.spawnDaemonDetached }));
 vi.mock('../../web-url.js', () => ({ printWebBanner: mocks.printWebBanner }));
+vi.mock('../../../kernel/codex/shared-daemon.js', () => ({ setCodexDesktopSharedEnv: mocks.setCodexDesktopSharedEnv }));
 
 import { runStart } from '../start.js';
 
@@ -21,6 +23,7 @@ describe('tlive start build handoff', () => {
     mocks.waitUntilSocketFree.mockResolvedValue(true);
     mocks.spawnDaemonDetached.mockReturnValue(22);
     mocks.printWebBanner.mockResolvedValue(undefined);
+    mocks.setCodexDesktopSharedEnv.mockResolvedValue(undefined);
     vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
   });
 
@@ -46,4 +49,3 @@ describe('tlive start build handoff', () => {
     expect(mocks.spawnDaemonDetached).toHaveBeenCalledOnce();
   });
 });
-

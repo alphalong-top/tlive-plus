@@ -13,6 +13,33 @@ describe('ensureCodexAppServer', () => {
     expect(spawnFn).not.toHaveBeenCalled();
     c!.stop(); // no-op, must not throw
   });
+  it('starts and adopts the managed daemon without spawning a direct app-server', async () => {
+    const probe = vi.fn()
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+    const spawnFn = vi.fn();
+    const startManaged = vi.fn(async () => true);
+    const c = await ensureCodexAppServer({
+      logPath: '/tmp/x.log', probe, spawnFn: spawnFn as any, startManaged,
+      sharedDaemon: true, platform: 'darwin', hasCodex: () => true,
+    });
+    expect(c).toMatchObject({ adopted: true });
+    expect(startManaged).toHaveBeenCalledOnce();
+    expect(spawnFn).not.toHaveBeenCalled();
+    c!.stop();
+  });
+  it('never falls back to a direct app-server when managed startup fails', async () => {
+    const states: string[] = [];
+    const spawnFn = vi.fn();
+    const c = await ensureCodexAppServer({
+      logPath: '/tmp/x.log', probe: async () => false, spawnFn: spawnFn as any,
+      startManaged: async () => false, sharedDaemon: true,
+      onStateChange: (state) => states.push(state), platform: 'darwin', hasCodex: () => true,
+    });
+    expect(c).toBeNull();
+    expect(spawnFn).not.toHaveBeenCalled();
+    expect(states).toEqual(['degraded']);
+  });
   it('spawns when socket absent and respawns on exit', async () => {
     vi.useFakeTimers();
     try {

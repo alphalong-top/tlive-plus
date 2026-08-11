@@ -21,6 +21,8 @@ interface ChildLike {
   kill: Function;
 }
 
+type SpawnMode = 'direct' | 'managed';
+
 const FAST_EXIT_MS = 5000;
 const MAX_BACKOFF_MS = 30_000;
 const MAX_FAST_EXITS = 6;
@@ -73,6 +75,34 @@ function defaultSpawnFn(logPath: string): ChildLike {
   return child;
 }
 
+function startManagedDaemon(logPath: string): Promise<boolean> {
+  const fd = openSync(logPath, 'a');
+  const shell = interactiveShell();
+  const child = nodeSpawn(shell ?? 'codex', shell
+    ? ['-ic', 'exec codex app-server daemon start']
+    : ['app-server', 'daemon', 'start'], {
+      stdio: ['ignore', fd, fd],
+      ...(shell ? { env: { ...process.env, TERM: process.env.TERM || 'xterm-256color' } } : {}),
+    });
+  try {
+    closeSync(fd);
+  } catch {
+    // best-effort close; a failure here must not mask the daemon result
+  }
+  return new Promise((resolve) => {
+    child.once('error', () => resolve(false));
+    child.once('exit', (code: number | null) => resolve(code === 0));
+  });
+}
+
+async function waitForSocket(probe: (sockPath: string) => Promise<boolean>, sockPath: string): Promise<boolean> {
+  for (let i = 0; i < 25; i++) {
+    if (await probe(sockPath)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  return false;
+}
+
 export async function ensureCodexAppServer(opts: {
   logPath: string;
   probe?: (sockPath: string) => Promise<boolean>;
@@ -80,6 +110,8 @@ export async function ensureCodexAppServer(opts: {
   onStateChange?: (s: 'running' | 'degraded') => void;
   platform?: NodeJS.Platform;
   hasCodex?: () => boolean;
+  sharedDaemon?: boolean;
+  startManaged?: (logPath: string) => Promise<boolean>;
 }): Promise<AppServerCustody | null> {
   const platform = opts.platform ?? process.platform;
   const hasCodex = opts.hasCodex ?? (() => Boolean(interactiveShell()) || commandOnPath('codex'));
@@ -87,6 +119,7 @@ export async function ensureCodexAppServer(opts: {
 
   const probe = opts.probe ?? defaultProbe;
   const spawnFn = opts.spawnFn ?? defaultSpawnFn;
+  const mode: SpawnMode = opts.sharedDaemon ? 'managed' : 'direct';
   const onStateChange = opts.onStateChange ?? (() => {});
 
   const sockPath = codexAppServerSockPath();
@@ -94,6 +127,17 @@ export async function ensureCodexAppServer(opts: {
   if (listening) {
     onStateChange('running');
     return { adopted: true, stop: () => {} };
+  }
+
+  if (mode === 'managed') {
+    const started = await (opts.startManaged ?? startManagedDaemon)(opts.logPath);
+    if (started && await waitForSocket(probe, sockPath)) {
+      onStateChange('running');
+      // The managed daemon owns its lifecycle; tlive must never kill it.
+      return { adopted: true, stop: () => {} };
+    }
+    onStateChange('degraded');
+    return null;
   }
 
   let stopped = false;

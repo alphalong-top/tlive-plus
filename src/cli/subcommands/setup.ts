@@ -153,5 +153,16 @@ export async function runSetup(argv: string[]): Promise<void> {
 
   try { rl.close(); } catch { /* already closed by piped-EOF */ }
   writeFileSync(configPath, JSON.stringify(cfg, null, 2));
-  process.stdout.write(`\nWritten ${configPath}\nNext: tlive start\n`);
+  process.stdout.write(`\nWritten ${configPath}\n`);
+
+  if (sel.codex && process.platform === 'darwin') {
+    try {
+      const { runCodex } = await import('./codex.js');
+      await runCodex(['shared', 'on']);
+    } catch (error) {
+      process.stderr.write(`⚠ Codex App sharing could not be enabled: ${error instanceof Error ? error.message : String(error)}\n`);
+    }
+  }
+
+  process.stdout.write('Next: tlive start\n');
 }

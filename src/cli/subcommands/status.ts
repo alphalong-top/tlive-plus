@@ -9,6 +9,7 @@ import { MODE_DESC } from '../../kernel/config/mode.js';
 import { resolveWebUrls, printWebBanner } from '../web-url.js';
 import { pluginHealth, defaultRunner } from '../../kernel/integrations/plugin-install.js';
 import { isCurrentBuild } from '../../kernel/build-id.js';
+import { codexDesktopSharedEnv } from '../../kernel/codex/shared-daemon.js';
 
 export async function runStatus(_argv: string[]): Promise<void> {
   const home = process.env.TLIVE_HOME ?? join(homedir(), '.tlive');
@@ -40,6 +41,9 @@ export async function runStatus(_argv: string[]): Promise<void> {
   }
 
   const cfg = loadConfig(home);
+  if (cfg.codex?.sharedDaemon === true) {
+    process.stdout.write(`codex app: shared daemon ${await codexDesktopSharedEnv() ? 'enabled' : 'configured, but App environment is missing'}\n`);
+  }
   // Posture line — the single most useful diagnostic for "why didn't I get a card?".
   // Shows the EFFECTIVE mode (same notify-default the shim enforces via effectiveMode).
   process.stdout.write(`mode:     ${MODE_DESC[effectiveMode(cfg.mode)]}\n`);

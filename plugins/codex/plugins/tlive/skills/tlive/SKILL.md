@@ -39,6 +39,8 @@ sessions (disable via `daemon.autoStart: false`).
 - `tlive logs -f` — follow the daemon log.
 - `tlive start` / `tlive stop` — explicit lifecycle (start is rarely needed;
   sessions lazy-start the daemon unless autoStart is off).
+- `tlive codex shared on|off|status` — inspect, repair, or disable the managed
+  app-server sharing that `tlive setup` configures automatically on macOS.
 - In IM chat, `/sessions [search]` pages through current and historical Codex
   threads; `/sessions archived [search]` browses archived threads. Select one,
   then use the Feishu card input or quote-reply on other channels to continue.
@@ -95,5 +97,6 @@ through:
    `tlive mode all` — flag the trade plainly: a held sub-agent has no terminal
    dialog until the window ends, so it only pays off when nobody is at the
    keyboard (`tlive mode full` to come back).
-5. Codex needs no extra step — the companion starts with the daemon. If status
-   says `off`/`degraded`, that's diagnostic info, not a setup task.
+5. On macOS, setup enables the shared app-server automatically. Fully quit and
+   reopen Codex App once after initial setup; use `tlive codex shared status`
+   only to diagnose or repair it.

@@ -22,6 +22,8 @@ Usage: tlive <subcommand> [args]   |   tlive --version
                      approval for the main session; all = also holds
                      sub-agent approvals (no terminal dialog until the window
                      ends — see README)
+  codex shared on|off|status  inspect, repair, or disable the Codex App sharing
+                     configured automatically by setup (macOS)
   mute on|off        mute / unmute IM notifications — on = quiet (same as IM /mute)
   trust on|off       pause approvals (auto-allow ALL) / resume (IM /trust)
   safe on|off        auto-allow routine ops, still ask for dangerous (IM /safe)
@@ -64,6 +66,7 @@ export async function runCli(argv: string[]): Promise<void> {
     case 'url': { const { runUrl } = await import('./subcommands/url.js'); return runUrl(rest); }
     case 'hook': { const { runHook } = await import('./subcommands/hook.js'); return runHook(rest); }
     case 'mode': { const { runMode } = await import('./subcommands/mode.js'); return runMode(rest); }
+    case 'codex': { const { runCodex } = await import('./subcommands/codex.js'); return runCodex(rest); }
     case 'mute': case 'trust': case 'safe': case 'desktop': {
       const { runToggle } = await import('./subcommands/toggle.js');
       return runToggle(name, rest);

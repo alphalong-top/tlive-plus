@@ -829,6 +829,7 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
   const ensureAppServer = opts.ensureAppServer ?? ensureCodexAppServer;
   const custody = await ensureAppServer({
     logPath: join(opts.home, 'codex-appserver.log'),
+    sharedDaemon: cfg.codex?.sharedDaemon === true,
     onStateChange: (s) => { codexState = s; },
   }).catch(() => null);
   // Indirection: onResumePrompt is needed at construction time, but resume()

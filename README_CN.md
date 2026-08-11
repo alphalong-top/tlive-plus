@@ -93,9 +93,9 @@ IM 消息带 `label · ` 前缀(会话目录名),但不再用图标区分包装/
     **绝不自动拒绝**——没人答时本地提示一直有效。
   - **发卡前静默** —— `approvals.approvalGraceSec`(默认 10 秒,`0` 关闭)先
     hold 住卡,键盘前马上答掉就压根不发;否则约 24 小时内可答。
-  - **Codex** —— tlive 接管(adopt/spawn)一个 `codex app-server` companion,
-    Codex TUI 自动连上;远程卡与原生提示同样竞速,没有窗口要配
-    (见[安全模型](#安全模型))。
+  - **Codex** —— macOS 上 `tlive setup` 自动让 tlive、Codex App/TUI
+    共同连接 managed `codex app-server`;两边收到同一审批事件,远程卡与
+    原生提示正常竞速。首次配置后只需完整重开一次 Codex App。
   - **渲染** —— diff/命令、高危模式标记、secret 打码。Telegram 卡片克制
     (标题粗体、按钮纯文字;唯一 emoji 是高危/错误上的 `⚠️`),长 diff 走
     expandable 折叠——用较新 Telegram 客户端渲染最佳。
@@ -185,10 +185,14 @@ hooks 块和 `hooks.json`,可以直接拷进去。
 ## Codex:app-server companion
 
 Codex 没有 hook、也没有信任这一步——上面 Claude 那套 hooks/trust 流程完全
-不适用。tlive 改为接管一个 `codex app-server --listen unix://…` 进程:
-如果 tlive 的 socket 路径上已经有一个在监听就直接 adopt,没有就自己 spawn
-并托管(带 respawn/backoff)。你跑的任何 `codex` TUI 都会**自动连上**那个
-socket——这是 Codex 自身的特性,不是 tlive 每次会话去配置的。
+不适用。在 macOS 上,`tlive setup` 会自动 bootstrap Codex 的 managed local
+app-server,配置 Codex App 使用它,并保存登录后恢复环境;tlive 随后 adopt 同一个
+socket,不再启动竞争 writer。首次配置后需要完整退出并重开一次 Codex App;
+`tlive codex shared status` 只用于检查或修复状态。
+
+这套配置只使用 Codex 当前的 local-daemon 功能开关,不会修改 Codex App 或
+二进制。`tlive stop` 只断开 tlive,managed app-server 继续运行,所以不会带停
+Codex App。`tlive codex shared off` 可回滚 App 环境设置,回滚后同样需要重启 App。
 
 在那条 RPC 连接上,tlive 订阅 Codex 自己的 thread/turn 事件,并通过
 `ServerRequest` 驱动审批:Codex 请求权限决策时,tlive 把同一个请求同时
@@ -246,6 +250,7 @@ tlive logs [-f]        看 daemon 日志
 tlive run <cmd> …      包装进程:本地终端 + web 终端
 tlive url              打印 dashboard 地址 + 二维码(全屏应用盖住 run banner 时用)
 tlive mode off|notify|full|all   设置姿态(见"功能一览");下一个 hook 即生效
+tlive codex shared on|off|status  检查、修复或关闭 setup 自动配置的共享服务(macOS)
 tlive hook <event>     hook shim(Claude Code 调用,不是给你用的;
                         Codex 没有 hook——见 app-server companion)
 ```
@@ -285,6 +290,7 @@ IM 命令:`/mute on|off`(静音 IM 通知)、`/trust on|off`(暂停审批——�
     "autoStart": true         // 默认 true;设 false 关闭 session-start 懒启动
   },
   "codex": {
+    "sharedDaemon": true,             // macOS 上由 `tlive setup` 自动写入
     // 重试终态的 429 / 502 / 503 / 模型容量不足。收到实际 agentMessage 会清零计数；
     // 达到上限后正常发送失败卡片。
     "autoRetry": {

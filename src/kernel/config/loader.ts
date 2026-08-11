@@ -14,6 +14,8 @@ export interface WebConfig {
 }
 export interface PolicyConfig { autoAllow?: string[]; autoDeny?: string[]; ask?: string[] }
 export interface CodexConfig {
+  /** Set automatically by setup on macOS so Desktop, CLI and tlive share one writer. */
+  sharedDaemon?: boolean;
   autoRetry?: { enabled?: boolean; delaysSec?: number[]; maxAttempts?: number; delaySec?: number; maxConsecutiveFailures?: number };
 }
 

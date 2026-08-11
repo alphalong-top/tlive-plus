@@ -162,9 +162,10 @@ continue" line makes the distinction moot for what you actually do.
   - **Grace before sending** — `approvals.approvalGraceSec` (default 10s, `0`
     disables) holds the card first, so answering right away means it's never
     sent; otherwise it stays answerable for ~24h.
-  - **Codex** — tlive spawns/adopts a `codex app-server` companion and Codex
-    TUIs auto-attach; the remote card and native prompt race the same way, with
-    no window to configure (see [Security](#security-model)).
+  - **Codex** — on macOS, `tlive setup` automatically makes tlive and Codex
+    App/TUI share a managed `codex app-server`; both receive the same approval
+    events, so the remote card and native prompt race normally. Fully reopen
+    Codex App once after the initial setup.
   - **Rendering** — diffs/commands, risky-pattern flags, secret masking.
     Telegram cards stay restrained (bold titles, plain-text buttons; the only
     emoji anywhere is `⚠️` on a risky flag / error), with expandable quotes for
@@ -274,11 +275,16 @@ through it interactively (Codex has no slash commands; use the phrase).
 ## Codex: the app-server companion
 
 Codex has no hooks and no trust step — the entire Claude-style hooks/trust
-dance above doesn't apply. Instead, `tlive` takes custody of a `codex
-app-server --listen unix://…` process: it adopts one already listening on
-tlive's socket path, or spawns and owns one (with respawn/backoff) if none
-is there. Any `codex` TUI you run **auto-attaches** to that socket — this
-is a Codex feature, not something tlive configures per-session.
+dance above doesn't apply. On macOS, `tlive setup` automatically bootstraps
+Codex's managed local app-server, configures Codex App to use it, and persists
+the login environment. tlive then adopts the same socket instead of starting a
+competing writer. Fully quit and reopen Codex App once after the initial setup;
+`tlive codex shared status` is only needed for inspection or repair.
+
+This setup uses Codex's current local-daemon feature flag. tlive never patches
+the Codex App or binary. `tlive stop` disconnects tlive but leaves the managed
+app-server alive, so Codex App keeps working. `tlive codex shared off` removes
+the App environment setting; fully restart Codex App to apply that rollback.
 
 Over that RPC connection tlive subscribes to Codex's own thread/turn
 events and drives approvals through `ServerRequest`: when Codex asks for a
@@ -350,6 +356,7 @@ tlive logs [-f]        tail the daemon log
 tlive run <cmd> …      wrap a process: local terminal + web terminal
 tlive url              print the dashboard URL + QR (when a full-screen app hid the run banner)
 tlive mode off|notify|full|all   set posture (see "What's in the box"); takes effect on the next hook
+tlive codex shared on|off|status  inspect, repair or disable setup's sharing (macOS)
 tlive hook <event>     hook shim (called by Claude Code, not by you;
                         Codex has no hooks — see the app-server companion)
 ```
@@ -392,6 +399,7 @@ inline input; other channels can quote-reply a session message.
     "autoStart": true         // default true; false disables session-start lazy-start
   },
   "codex": {
+    "sharedDaemon": true,             // set automatically by `tlive setup` on macOS
     // Retry terminal 429 / 502 / 503 / model-capacity failures. A real agentMessage
     // resets the counter; at the limit tlive sends the normal failure card.
     "autoRetry": {

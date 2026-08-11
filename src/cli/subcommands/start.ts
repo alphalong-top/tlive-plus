@@ -7,11 +7,19 @@ import { printWebBanner } from '../web-url.js';
 import { spawnDaemonDetached, daemonEntryPath } from '../../kernel/daemon/spawn.js';
 import { waitUntilSocketFree } from '../../kernel/ipc/server.js';
 import { isCurrentBuild } from '../../kernel/build-id.js';
+import { loadConfig } from '../../kernel/config/loader.js';
+import { setCodexDesktopSharedEnv } from '../../kernel/codex/shared-daemon.js';
 
 export async function runStart(argv: string[]): Promise<void> {
   const home = process.env.TLIVE_HOME ?? join(homedir(), '.tlive');
   const sockPath = defaultSocketPath();
   const foreground = argv.includes('--foreground') || argv.includes('-F');
+
+  if (loadConfig(home).codex?.sharedDaemon === true) {
+    await setCodexDesktopSharedEnv(true).catch((error) => {
+      process.stderr.write(`tlive: could not enable Codex App shared daemon: ${error instanceof Error ? error.message : String(error)}\n`);
+    });
+  }
 
   // A replaced global package can leave the old in-memory daemon serving IM.
   // Missing buildId means a pre-fingerprint daemon, so the first upgrade also restarts.

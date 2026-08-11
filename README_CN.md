@@ -190,11 +190,12 @@ app-server,配置 Codex App 使用它,并保存登录后恢复环境;tlive 随�
 socket,不再启动竞争 writer。首次配置后需要完整退出并重开一次 Codex App;
 `tlive codex shared status` 只用于检查或修复状态。
 
-这套配置使用 Codex App 内部的 `CODEX_APP_SERVER_WS_URL`,通过 `ws+unix:`
-直接连接 managed socket,绕过可能静默回退到独立 writer 的 daemon 探测。
-它不会修改 Codex App 或二进制。`tlive stop` 只断开 tlive,managed app-server
-继续运行,所以不会带停 Codex App。`tlive codex shared off` 可回滚 App 环境设置,
-回滚后同样需要重启 App。
+这套配置使用 Codex App 内部的 `CODEX_APP_SERVER_WS_URL`,并由 launchd 常驻的
+轻量 bridge 将 `ws://127.0.0.1:43873` 转发到 managed Unix socket。必须使用
+loopback URL,因为 Codex App 会把非本地主机的 WebSocket 连接送入内置 SOCKS
+fallback。它不会修改 Codex App 或二进制。`tlive stop` 只断开 tlive,bridge 和
+managed app-server 继续运行,所以不会带停 Codex App。`tlive codex shared off`
+会移除 bridge 和 App 环境设置,回滚后同样需要重启 App。
 
 在那条 RPC 连接上,tlive 订阅 Codex 自己的 thread/turn 事件,并通过
 `ServerRequest` 驱动审批:Codex 请求权限决策时,tlive 把同一个请求同时

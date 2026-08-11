@@ -5,6 +5,7 @@ import { execSync } from 'node:child_process';
 
 // 1. Best-effort stop the daemon (ignore if not running).
 try { execSync('tlive stop', { stdio: 'ignore', timeout: 5000 }); } catch {}
+try { execSync('tlive codex shared off', { stdio: 'ignore', timeout: 5000 }); } catch {}
 
 // 1b. Best-effort uninstall the vendor plugins registered by `tlive setup`
 //     (plugin-install.ts). Failures (vendor CLI missing / plugin not

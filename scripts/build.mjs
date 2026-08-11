@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 // scripts/build.mjs
 //
-// Unified build for tlive. Emits exactly 2 entries:
+// Unified build for tlive. Emits 3 Node entries:
 //   - dist/src/tlive-daemon.mjs (long-running daemon, src/kernel/daemon/main.ts)
 //   - dist/src/tlive-cli.mjs    (CLI dispatcher, src/cli/main.ts; lazy-imports subcommands)
+//   - dist/src/tlive-codex-bridge.mjs (durable loopback bridge for Codex App)
 
 import { build } from 'esbuild';
 import { createHash } from 'node:crypto';
@@ -67,6 +68,9 @@ if (cliOk) {
   chmodSync(join(ROOT, 'dist', 'src', 'tlive-cli.mjs'), 0o755);
   console.log('built dist/src/tlive-cli.mjs');
 }
+
+const bridgeOk = await buildEntry('src/kernel/codex/ws-bridge-main.ts', 'tlive-codex-bridge');
+if (bridgeOk) console.log('built dist/src/tlive-codex-bridge.mjs');
 
 // Frontend bundle (browser) — xterm terminal page → dist/web
 mkdirSync(join(ROOT, 'dist', 'web'), { recursive: true });

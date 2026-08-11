@@ -3,8 +3,10 @@ import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from '
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
+import { codexAppServerSockPath } from './spawn.js';
 
 export const CODEX_LOCAL_DAEMON_ENV = 'CODEX_APP_SERVER_USE_LOCAL_DAEMON';
+export const CODEX_WS_URL_ENV = 'CODEX_APP_SERVER_WS_URL';
 const ENV_AGENT_LABEL = 'top.alphalong.tlive.codex-shared-env';
 
 const execFile = promisify(nodeExecFile);
@@ -31,12 +33,16 @@ export function codexSharedEnvAgentPath(userHome = homedir()): string {
   return join(userHome, 'Library', 'LaunchAgents', `${ENV_AGENT_LABEL}.plist`);
 }
 
-function persistCodexDesktopSharedEnv(enabled: boolean): void {
-  const path = codexSharedEnvAgentPath();
-  if (!enabled) {
-    if (existsSync(path)) unlinkSync(path);
-    return;
-  }
+export function codexAppServerWsUrl(codexHome?: string): string {
+  return `ws+unix:${codexAppServerSockPath(codexHome)}:/`;
+}
+
+function xml(value: string): string {
+  return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+}
+
+export function writeCodexDesktopSharedEnvAgent(userHome = homedir(), codexHome?: string): string {
+  const path = codexSharedEnvAgentPath(userHome);
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -44,26 +50,40 @@ function persistCodexDesktopSharedEnv(enabled: boolean): void {
   <key>Label</key><string>${ENV_AGENT_LABEL}</string>
   <key>ProgramArguments</key><array>
     <string>/bin/launchctl</string><string>setenv</string>
-    <string>${CODEX_LOCAL_DAEMON_ENV}</string><string>1</string>
+    <string>${CODEX_WS_URL_ENV}</string><string>${xml(codexAppServerWsUrl(codexHome))}</string>
   </array>
   <key>RunAtLoad</key><true/>
 </dict></plist>
 `);
+  return path;
+}
+
+function persistCodexDesktopSharedEnv(enabled: boolean): void {
+  const path = codexSharedEnvAgentPath();
+  if (enabled) writeCodexDesktopSharedEnvAgent();
+  else if (existsSync(path)) unlinkSync(path);
 }
 
 export async function setCodexDesktopSharedEnv(enabled: boolean): Promise<void> {
   if (process.platform !== 'darwin') return;
   persistCodexDesktopSharedEnv(enabled);
-  await execFile('launchctl', userLaunchctlArgs(enabled
-    ? ['setenv', CODEX_LOCAL_DAEMON_ENV, '1']
-    : ['unsetenv', CODEX_LOCAL_DAEMON_ENV]));
+  if (enabled) {
+    await execFile('launchctl', userLaunchctlArgs(['setenv', CODEX_WS_URL_ENV, codexAppServerWsUrl()]));
+    // Remove the old probe-based switch: WS_URL selects the shared transport
+    // directly, while USE_LOCAL_DAEMON silently falls back to a private writer
+    // whenever Codex App's daemon probe fails.
+    await execFile('launchctl', userLaunchctlArgs(['unsetenv', CODEX_LOCAL_DAEMON_ENV]));
+  } else {
+    await execFile('launchctl', userLaunchctlArgs(['unsetenv', CODEX_WS_URL_ENV]));
+    await execFile('launchctl', userLaunchctlArgs(['unsetenv', CODEX_LOCAL_DAEMON_ENV]));
+  }
 }
 
 export async function codexDesktopSharedEnv(): Promise<boolean> {
   if (process.platform !== 'darwin') return false;
   try {
-    const { stdout } = await execFile('launchctl', userLaunchctlArgs(['getenv', CODEX_LOCAL_DAEMON_ENV]));
-    return stdout.trim() === '1';
+    const { stdout } = await execFile('launchctl', userLaunchctlArgs(['getenv', CODEX_WS_URL_ENV]));
+    return stdout.trim() === codexAppServerWsUrl();
   } catch {
     return false;
   }

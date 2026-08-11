@@ -65,7 +65,9 @@ Codex needs neither a hooks config nor a trust step. Integration rides the
 app-server companion instead. On macOS, `tlive setup` configures sharing
 automatically; fully restart Codex App once afterward. Codex App, CLI and tlive
 then connect to the same managed app-server, so approvals and monitoring flow
-over one writer-safe RPC server.
+over one writer-safe RPC server. The App connects through its internal
+`CODEX_APP_SERVER_WS_URL` using the managed socket's native `ws+unix:` URL;
+tlive does not patch or re-sign the App.
 There is nothing to write into `~/.codex/hooks.json` and nothing to approve in
 a hooks review.
 

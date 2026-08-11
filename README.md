@@ -281,10 +281,13 @@ the login environment. tlive then adopts the same socket instead of starting a
 competing writer. Fully quit and reopen Codex App once after the initial setup;
 `tlive codex shared status` is only needed for inspection or repair.
 
-This setup uses Codex's current local-daemon feature flag. tlive never patches
-the Codex App or binary. `tlive stop` disconnects tlive but leaves the managed
-app-server alive, so Codex App keeps working. `tlive codex shared off` removes
-the App environment setting; fully restart Codex App to apply that rollback.
+This setup uses Codex App's internal `CODEX_APP_SERVER_WS_URL` transport and a
+`ws+unix:` URL that points directly at the managed socket. This bypasses the
+App's daemon probe, which can silently fall back to a private writer. tlive
+never patches the Codex App or binary. `tlive stop` disconnects tlive but leaves
+the managed app-server alive, so Codex App keeps working. `tlive codex shared
+off` removes the App environment setting; fully restart Codex App to apply that
+rollback.
 
 Over that RPC connection tlive subscribes to Codex's own thread/turn
 events and drives approvals through `ServerRequest`: when Codex asks for a

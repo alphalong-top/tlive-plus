@@ -15,6 +15,12 @@ export interface CompanionDeps {
   permissionRouter: Pick<PermissionRouter, 'requestPermission' | 'cancel'>;
   onMonitor: (ev: MonitorEvent, key: string) => void;
   onResumePrompt: (p: { threadId: string; key: string; lastMessage?: string; error?: string }) => void;
+  /** Persist turns accepted through tlive so a daemon restart can recover the
+   *  one completion it owes IM, without replaying ordinary history. */
+  onTurnAccepted?: (threadId: string, turnId: string) => void;
+  /** Delete and report whether this exact tlive-started turn was still waiting
+   *  for its completion card. Missing turnId clears any marker for the thread. */
+  consumePendingTurn?: (threadId: string, turnId?: string) => boolean;
   onAutoRetry?: (p: { threadId: string; key: string; prompt: string; error: string; attempt: number; maxAttempts: number }) => void;
   /** 远程审批窗口(秒),与 CC 共用 approvals.windowSec —— 消除"一家可配一家硬编码"的不对称。 */
   windowSec: () => number;
@@ -78,6 +84,11 @@ const RECONNECT_MAX_MS = 30_000;
 const POLL_MS = 5_000;
 const AUTO_RETRY_PROMPT = '从中断处继续';
 const DEFAULT_RETRY_DELAYS_MS = [60_000, 180_000, 300_000];
+const compactResumeParams = (threadId: string) => ({
+  threadId,
+  excludeTurns: true,
+  initialTurnsPage: { limit: 1, sortDirection: 'desc', itemsView: 'full' },
+});
 
 function isRetryableProviderError(message: string): boolean {
   return /\b(?:429|502|503)\b|(?:upstream )?service (?:temporarily )?unavailable|selected model is at capacity|stream disconnected before completion|upstream request failed/i.test(message);
@@ -172,17 +183,34 @@ export function startCompanion(deps: CompanionDeps): Companion {
   type ResumeResult = {
     cwd?: unknown;
     thread?: {
-      turns?: Array<{ id?: unknown; status?: unknown }>;
+      turns?: ResumeTurn[];
     };
+    initialTurnsPage?: { data?: ResumeTurn[] } | null;
+  };
+
+  type ResumeTurn = {
+    id?: unknown;
+    status?: unknown;
+    error?: unknown;
+    items?: Array<{ type?: unknown; text?: unknown }>;
+  };
+
+  const resumedTurns = (res: ResumeResult | undefined): ResumeTurn[] =>
+    res?.initialTurnsPage?.data?.length ? res.initialTurnsPage.data : (res?.thread?.turns ?? []).slice().reverse();
+
+  const rememberTurnMessage = (threadId: string, turn: ResumeTurn): void => {
+    const item = turn.items?.slice().reverse().find((v) => v.type === 'agentMessage' && typeof v.text === 'string' && v.text.trim());
+    if (typeof item?.text === 'string') lastMessages.set(threadId, item.text);
   };
 
   /** Cache the resumed thread's cwd, register idle threads in the session list,
    *  and return the currently-running turn id when one exists. */
-  function captureResume(threadId: string, res: unknown): string | undefined {
+  function captureResume(threadId: string, res: unknown, recoverCompletion = false): string | undefined {
     const resumedThread = res as ResumeResult | undefined;
     const cwd = resumedThread?.cwd;
     if (typeof cwd === 'string' && cwd) threadCwds.set(threadId, cwd);
-    const activeTurn = resumedThread?.thread?.turns?.slice().reverse().find(
+    const turns = resumedTurns(resumedThread);
+    const activeTurn = turns.find(
       (turn) => turn.status === 'inProgress' && typeof turn.id === 'string',
     );
     const key = threadKey(threadId);
@@ -192,6 +220,15 @@ export function startCompanion(deps: CompanionDeps): Companion {
         : { event: 'session-start', cwd: cwdOf(threadId), sessionId: threadId },
       key,
     );
+    const latest = turns[0];
+    if (recoverCompletion && !activeTurn && typeof latest?.id === 'string'
+      && ['completed', 'failed', 'interrupted'].includes(String(latest.status))
+      && deps.consumePendingTurn?.(threadId, latest.id)) {
+      rememberTurnMessage(threadId, latest);
+      const error = latest.status === 'failed' ? readTurnError(latest.error) ?? 'Unknown Codex error' : undefined;
+      if (error) reportFailedTurn(threadId, latest.id, error);
+      else notifyTurnEnd(threadId);
+    }
     return activeTurn?.id as string | undefined;
   }
 
@@ -201,9 +238,9 @@ export function startCompanion(deps: CompanionDeps): Companion {
       if (!force && resumed.has(threadId)) return;
       resumed.add(threadId);
     }
-    rpc.call('thread/resume', { threadId }).then(
+    rpc.call('thread/resume', compactResumeParams(threadId)).then(
       (res) => {
-        if (!force) captureResume(threadId, res);
+        if (!force) captureResume(threadId, res, true);
         else {
           const cwd = (res as ResumeResult | undefined)?.cwd;
           if (typeof cwd === 'string' && cwd) threadCwds.set(threadId, cwd);
@@ -227,12 +264,14 @@ export function startCompanion(deps: CompanionDeps): Companion {
     cancelAutoRetry(threadId);
     if (!rpc) throw new Error('companion: not connected');
     const items = [{ type: 'text', text: input }];
-    let activeTurnId = captureResume(threadId, await rpc.call('thread/resume', { threadId }));
+    let activeTurnId = captureResume(threadId, await rpc.call('thread/resume', compactResumeParams(threadId)));
     try {
       if (activeTurnId) {
         await rpc.call('turn/steer', { threadId, input: items, expectedTurnId: activeTurnId });
+        deps.onTurnAccepted?.(threadId, activeTurnId);
       } else {
-        await rpc.call('turn/start', { threadId, input: items });
+        const started = await rpc.call('turn/start', { threadId, input: items }) as { turn?: { id?: unknown } } | undefined;
+        if (typeof started?.turn?.id === 'string') deps.onTurnAccepted?.(threadId, started.turn.id);
       }
     } catch (err) {
       // The local terminal may start/finish a turn between resume and send.
@@ -240,11 +279,13 @@ export function startCompanion(deps: CompanionDeps): Companion {
       // failures that may already have accepted the input.
       const msg = err instanceof Error ? err.message : String(err);
       if (!/active turn|turn.*(?:running|in progress)|no active turn|expectedTurnId|does not match/i.test(msg)) throw err;
-      const refreshed = captureResume(threadId, await rpc.call('thread/resume', { threadId }));
+      const refreshed = captureResume(threadId, await rpc.call('thread/resume', compactResumeParams(threadId)));
       if (refreshed && refreshed !== activeTurnId) {
         await rpc.call('turn/steer', { threadId, input: items, expectedTurnId: refreshed });
+        deps.onTurnAccepted?.(threadId, refreshed);
       } else if (!refreshed && activeTurnId) {
-        await rpc.call('turn/start', { threadId, input: items });
+        const started = await rpc.call('turn/start', { threadId, input: items }) as { turn?: { id?: unknown } } | undefined;
+        if (typeof started?.turn?.id === 'string') deps.onTurnAccepted?.(threadId, started.turn.id);
       } else {
         throw err;
       }
@@ -276,6 +317,7 @@ export function startCompanion(deps: CompanionDeps): Companion {
         }),
         (err: unknown) => {
           log(`companion: automatic retry ${threadId} failed: ${err instanceof Error ? err.message : String(err)}`);
+          deps.consumePendingTurn?.(threadId, turnId);
           notifyTurnEnd(threadId, message);
         },
       );
@@ -288,7 +330,10 @@ export function startCompanion(deps: CompanionDeps): Companion {
   function reportFailedTurn(threadId: string, turnId: string, message: string): void {
     if (turnId && notifiedFailures.get(threadId) === turnId) return;
     if (turnId) notifiedFailures.set(threadId, turnId);
-    if (!retryFailedTurn(threadId, turnId, message)) notifyTurnEnd(threadId, message);
+    if (!retryFailedTurn(threadId, turnId, message)) {
+      deps.consumePendingTurn?.(threadId, turnId || undefined);
+      notifyTurnEnd(threadId, message);
+    }
   }
 
   async function pollThreads(): Promise<void> {
@@ -430,7 +475,10 @@ export function startCompanion(deps: CompanionDeps): Companion {
           : undefined;
         latestErrors.delete(threadId);
         if (error) reportFailedTurn(threadId, turnId, error);
-        else notifyTurnEnd(threadId);
+        else {
+          deps.consumePendingTurn?.(threadId, turnId || undefined);
+          notifyTurnEnd(threadId);
+        }
       }
       return;
     }
@@ -451,6 +499,7 @@ export function startCompanion(deps: CompanionDeps): Companion {
         cancelAutoRetry(threadId);
         latestErrors.delete(threadId);
         notifiedFailures.delete(threadId);
+        deps.consumePendingTurn?.(threadId);
         for (const replayKey of approvalReplays.keys()) {
           if (replayKey.startsWith(`${threadId}\0`)) approvalReplays.delete(replayKey);
         }

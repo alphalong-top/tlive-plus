@@ -9,6 +9,7 @@ function harness(autoRetry: { enabled?: boolean; delaysSec?: number[]; maxAttemp
       calls.push({ method, params });
       if (method === 'thread/loaded/list') return { data: ['t1'] };
       if (method === 'thread/resume') return { thread: { id: params.threadId } };
+      if (method === 'turn/start') return { turn: { id: 'turn-started' } };
       return {};
     }),
     notify: vi.fn(),
@@ -17,17 +18,19 @@ function harness(autoRetry: { enabled?: boolean; delaysSec?: number[]; maxAttemp
   const router = { requestPermission: vi.fn(async () => ({ decision: 'allow' })), cancel: vi.fn(() => 0) };
   const onMonitor = vi.fn();
   const onResumePrompt = vi.fn();
+  const onTurnAccepted = vi.fn();
   const onAutoRetry = vi.fn();
   const comp = startCompanion({
     connect: async (e: any) => { events = e; return rpc as any; },
     permissionRouter: router as any,
     onMonitor,
     onResumePrompt,
+    onTurnAccepted,
     onAutoRetry,
     windowSec: () => 86_400,
     autoRetry: () => autoRetry,
   });
-  return { rpc, router, onMonitor, onResumePrompt, onAutoRetry, comp, calls, getEvents: () => events, setEvents: (e: any) => { events = e; } };
+  return { rpc, router, onMonitor, onResumePrompt, onTurnAccepted, onAutoRetry, comp, calls, getEvents: () => events, setEvents: (e: any) => { events = e; } };
 }
 
 describe('companion', () => {
@@ -41,10 +44,89 @@ describe('companion', () => {
     await Promise.resolve();
     expect(calls.some((c) => c.method === 'thread/loaded/list')).toBe(true);
     expect(calls.some((c) => c.method === 'thread/resume' && c.params.threadId === 't1')).toBe(true);
+    expect(calls.find((c) => c.method === 'thread/resume')?.params).toMatchObject({
+      excludeTurns: true,
+      initialTurnsPage: { limit: 1, sortDirection: 'desc', itemsView: 'full' },
+    });
     expect(onMonitor).toHaveBeenCalledWith(
       { event: 'session-start', cwd: 'codex:t1', sessionId: 't1' },
       'codex:t1',
     );
+    comp.stop();
+  });
+
+  it('recovers only a persisted tlive turn completed while the daemon was down', async () => {
+    let events: any;
+    const consumePendingTurn = vi.fn((threadId: string, turnId?: string) => threadId === 't1' && turnId === 'turn-1');
+    const rpc = {
+      call: vi.fn(async (method: string, params: any) => {
+        if (method === 'thread/loaded/list') return { data: ['t1'] };
+        if (method === 'thread/list') return { data: [] };
+        if (method === 'thread/resume') return {
+          cwd: '/repo',
+          thread: { id: params.threadId, turns: [] },
+          initialTurnsPage: {
+            data: [{
+              id: 'turn-1', status: 'completed', error: null,
+              items: [{ type: 'agentMessage', id: 'msg-1', text: 'answer completed during restart' }],
+            }],
+          },
+        };
+        return {};
+      }),
+      notify: vi.fn(),
+      close: vi.fn(),
+    };
+    const onResumePrompt = vi.fn();
+    const comp = startCompanion({
+      connect: async (e: any) => { events = e; return rpc as any; },
+      permissionRouter: { requestPermission: vi.fn(), cancel: vi.fn(() => 0) } as any,
+      onMonitor: vi.fn(),
+      onResumePrompt,
+      consumePendingTurn,
+      windowSec: () => 86_400,
+    });
+
+    await vi.runOnlyPendingTimersAsync();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(events).toBeDefined();
+    expect(consumePendingTurn).toHaveBeenCalledWith('t1', 'turn-1');
+    expect(onResumePrompt).toHaveBeenCalledWith({
+      threadId: 't1', key: 'codex:t1', lastMessage: 'answer completed during restart',
+    });
+    comp.stop();
+  });
+
+  it('does not replay an ordinary historical completed turn on daemon startup', async () => {
+    let events: any;
+    const rpc = {
+      call: vi.fn(async (method: string, params: any) => {
+        if (method === 'thread/loaded/list') return { data: ['t1'] };
+        if (method === 'thread/list') return { data: [] };
+        if (method === 'thread/resume') return {
+          thread: { id: params.threadId, turns: [] },
+          initialTurnsPage: { data: [{ id: 'old-turn', status: 'completed', error: null, items: [] }] },
+        };
+        return {};
+      }),
+      notify: vi.fn(), close: vi.fn(),
+    };
+    const onResumePrompt = vi.fn();
+    const comp = startCompanion({
+      connect: async (e: any) => { events = e; return rpc as any; },
+      permissionRouter: { requestPermission: vi.fn(), cancel: vi.fn(() => 0) } as any,
+      onMonitor: vi.fn(), onResumePrompt,
+      consumePendingTurn: vi.fn(() => false),
+      windowSec: () => 86_400,
+    });
+
+    await vi.runOnlyPendingTimersAsync();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(events).toBeDefined();
+    expect(onResumePrompt).not.toHaveBeenCalled();
     comp.stop();
   });
 
@@ -544,13 +626,14 @@ describe('companion', () => {
   });
 
   it('resume() calls turn/start with items array', async () => {
-    const { comp, calls } = harness();
+    const { comp, calls, onTurnAccepted } = harness();
     await vi.runOnlyPendingTimersAsync();
     await Promise.resolve();
     await Promise.resolve();
     await comp.resume('t1', 'fix tests');
     expect(calls.some((c) => c.method === 'turn/start' && c.params.threadId === 't1'
       && Array.isArray(c.params.input) && c.params.input[0].text === 'fix tests')).toBe(true);
+    expect(onTurnAccepted).toHaveBeenCalledWith('t1', 'turn-started');
     comp.stop();
   });
 
@@ -599,7 +682,7 @@ describe('companion', () => {
   });
 
   it('resume() steers the active turn instead of starting a conflicting turn', async () => {
-    const { comp, rpc } = harness();
+    const { comp, rpc, onTurnAccepted } = harness();
     await vi.runOnlyPendingTimersAsync();
     await Promise.resolve();
     await Promise.resolve();
@@ -615,6 +698,7 @@ describe('companion', () => {
       input: [{ type: 'text', text: 'focus on the failing test' }],
       expectedTurnId: 'turn-active',
     });
+    expect(onTurnAccepted).toHaveBeenCalledWith('t1', 'turn-active');
     comp.stop();
   });
 

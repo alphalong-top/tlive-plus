@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { bootstrapDaemon, shouldFastNullContinue, clampPermissionTimeout, createMessageRouteStore, makeCodexResumeHandler, shouldDropNotify, resolveKey, type DaemonHandle } from '../bootstrap';
+import { bootstrapDaemon, shouldFastNullContinue, clampPermissionTimeout, createMessageRouteStore, createPendingCodexTurnStore, makeCodexResumeHandler, shouldDropNotify, resolveKey, type DaemonHandle } from '../bootstrap';
 import { request, daemonSocketPath } from '../../ipc/client';
 import type { IMAdapter, IMChannel, OutgoingMessage, IncomingEnvelope } from '../../contracts/im-adapter';
 import { SessionRegistry } from '../../web/session-registry';
@@ -105,6 +105,19 @@ describe('persistent message routes', () => {
     const path = join(tmp, 'message-routes.json');
     createMessageRouteStore(path).remember('feishu', 'message-1', 'codex:thread-1');
     expect(createMessageRouteStore(path).get('feishu', 'message-1')).toBe('codex:thread-1');
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+  });
+});
+
+describe('persistent Codex continuation turns', () => {
+  it('survives daemon recreation and consumes only the matching completed turn', () => {
+    const path = join(tmp, 'codex-pending-turns.json');
+    createPendingCodexTurnStore(path).remember('thread-1', 'turn-1');
+
+    const reloaded = createPendingCodexTurnStore(path);
+    expect(reloaded.consume('thread-1', 'turn-other')).toBe(false);
+    expect(reloaded.consume('thread-1', 'turn-1')).toBe(true);
+    expect(reloaded.consume('thread-1', 'turn-1')).toBe(false);
     expect(statSync(path).mode & 0o777).toBe(0o600);
   });
 });

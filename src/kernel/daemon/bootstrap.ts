@@ -132,6 +132,7 @@ export const STALE_CARD_NOTICE =
   'This request is no longer active — the session ended, timed out, or tlive restarted. Answer at the keyboard.';
 
 const MESSAGE_ROUTE_LIMIT = 500;
+const PENDING_CODEX_TURN_LIMIT = 100;
 
 /** Persistent IM message → session routing. Only opaque ids are stored; no
  *  prompts, card bodies or credentials enter this file. */
@@ -164,6 +165,50 @@ export function createMessageRouteStore(path: string): {
       const tmp = `${path}.${process.pid}.tmp`;
       writeFileSync(tmp, JSON.stringify([...routes]), { mode: 0o600 });
       renameSync(tmp, path);
+    },
+  };
+}
+
+/** Turns started by tlive whose completion card has not yet been emitted.
+ *  Persisting only opaque ids lets a restarted daemon recover exactly that
+ *  completion without replaying every idle Codex thread as new. */
+export function createPendingCodexTurnStore(path: string): {
+  remember(threadId: string, turnId: string): void;
+  consume(threadId: string, turnId?: string): boolean;
+} {
+  let entries: Array<[string, string]> = [];
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8')) as unknown;
+    if (Array.isArray(parsed)) {
+      entries = parsed.filter((v): v is [string, string] =>
+        Array.isArray(v) && v.length === 2 && typeof v[0] === 'string' && typeof v[1] === 'string',
+      ).slice(-PENDING_CODEX_TURN_LIMIT);
+    }
+  } catch { /* first start or damaged cache */ }
+  const turns = new Map(entries);
+  const persist = (): void => {
+    const tmp = `${path}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify([...turns]), { mode: 0o600 });
+    renameSync(tmp, path);
+  };
+  return {
+    remember(threadId, turnId): void {
+      if (!threadId || !turnId) return;
+      if (turns.has(threadId)) turns.delete(threadId);
+      while (turns.size >= PENDING_CODEX_TURN_LIMIT) {
+        const oldest = turns.keys().next().value;
+        if (oldest === undefined) break;
+        turns.delete(oldest);
+      }
+      turns.set(threadId, turnId);
+      persist();
+    },
+    consume(threadId, turnId): boolean {
+      const pending = turns.get(threadId);
+      if (!pending || (turnId !== undefined && pending !== turnId)) return false;
+      turns.delete(threadId);
+      persist();
+      return true;
     },
   };
 }
@@ -232,6 +277,7 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
     try { messageRoutes.remember(channel, messageId, key); }
     catch { logJson('message-route.persist-failed', { channel }); }
   };
+  const pendingCodexTurns = createPendingCodexTurnStore(join(opts.home, 'codex-pending-turns.json'));
 
   // Approval cards sent per requestId — edited to their outcome on resolve (no
   // zombie buttons). `title`/`body` track the card's CURRENT contents, not the
@@ -864,6 +910,17 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
         events.broadcast(applyMonitorEvent(sessions, ev, key));
       },
       onResumePrompt: onCodexResumePrompt,
+      onTurnAccepted: (threadId, turnId) => {
+        try { pendingCodexTurns.remember(threadId, turnId); }
+        catch { logJson('codex.pending-turn.persist-failed', { threadId }); }
+      },
+      consumePendingTurn: (threadId, turnId) => {
+        try { return pendingCodexTurns.consume(threadId, turnId); }
+        catch {
+          logJson('codex.pending-turn.consume-failed', { threadId });
+          return false;
+        }
+      },
       onAutoRetry: ({ key, prompt, error, attempt, maxAttempts }) => {
         if (muted || sessions.get(key)?.muted) return;
         for (const target of configuredChats()) {

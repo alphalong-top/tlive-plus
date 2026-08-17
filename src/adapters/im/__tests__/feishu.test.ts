@@ -3,10 +3,12 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // capturedHandlers is populated by the EventDispatcher mock's register() call.
 const capturedHandlers: Record<string, (data: unknown) => Promise<unknown>> = {};
 const close = vi.fn();
+const wsOptions: Array<Record<string, unknown>> = [];
 
 vi.mock('@larksuiteoapi/node-sdk', () => ({
   Client: class { im = { v1: { message: { create: vi.fn(async () => ({ data: { message_id: 'fmid-1' } })), patch: vi.fn() } } }; },
   WSClient: class {
+    constructor(opts: Record<string, unknown>) { wsOptions.push(opts); }
     start = vi.fn(); close = close;
   },
   EventDispatcher: class {
@@ -23,11 +25,13 @@ describe('FeishuAdapter', () => {
     // Clear captured handlers before each test so tests don't bleed into each other.
     for (const k of Object.keys(capturedHandlers)) delete capturedHandlers[k];
     close.mockClear();
+    wsOptions.length = 0;
   });
 
   it('start + stop', async () => {
     const a = new FeishuAdapter({ appId: 'A', appSecret: 'S' });
     await a.start();
+    expect(wsOptions[0].agent).toBeDefined();
     expect(a.isConnected()).toBe('connected');
     await a.stop();
     expect(a.isConnected()).toBe('idle');

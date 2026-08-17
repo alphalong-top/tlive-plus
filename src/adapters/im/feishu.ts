@@ -10,7 +10,9 @@
 // should be verified against a live Feishu app (no creds available in CI).
 
 import { Client, WSClient, EventDispatcher } from '@larksuiteoapi/node-sdk';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, readFileSync } from 'node:fs';
+import { lookup as systemLookup, promises as dns } from 'node:dns';
+import { Agent } from 'node:https';
 import { join, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
@@ -22,6 +24,43 @@ export interface FeishuAdapterOpts {
   appSecret: string;
   /** chat ID to send to; for now require single chat. */
   chatId?: string;
+}
+
+function feishuWsAgent(): Agent | undefined {
+  let servers: string[];
+  try {
+    servers = [...readFileSync('/etc/resolv.conf', 'utf8').matchAll(/^nameserver\s+(\S+)/gm)].map((m) => m[1]);
+  } catch {
+    return undefined;
+  }
+  if (!servers.length) return undefined;
+  const resolver = new dns.Resolver();
+  try {
+    resolver.setServers(servers);
+  } catch {
+    return undefined;
+  }
+  return new Agent({
+    lookup(hostname, options, callback) {
+      systemLookup(hostname, options, (error, address, family) => {
+        if (!error) {
+          if (typeof options === 'object' && options.all) {
+            callback(null, (address as unknown as Array<{ address: string; family: number }>));
+          } else {
+            callback(null, address, family);
+          }
+          return;
+        }
+        void resolver.resolve4(hostname).then(
+          (addresses) => {
+            if (typeof options === 'object' && options.all) callback(null, addresses.map((ip) => ({ address: ip, family: 4 })));
+            else callback(null, addresses[0], 4);
+          },
+          () => callback(error, ''),
+        );
+      });
+    },
+  });
 }
 
 type CardMessage = Extract<OutgoingMessage, { kind: 'card' }>;
@@ -204,7 +243,8 @@ export class FeishuAdapter implements IMAdapter {
   async start(): Promise<void> {
     if (this.connected === 'connected') return;
     this.client = new Client({ appId: this.opts.appId, appSecret: this.opts.appSecret });
-    this.ws = new WSClient({ appId: this.opts.appId, appSecret: this.opts.appSecret });
+    const agent = feishuWsAgent();
+    this.ws = new WSClient({ appId: this.opts.appId, appSecret: this.opts.appSecret, ...(agent ? { agent } : {}) });
     const dispatcher = new EventDispatcher({});
     dispatcher.register({
       'im.message.receive_v1': async (data: unknown) => {

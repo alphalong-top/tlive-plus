@@ -69,8 +69,6 @@ export interface CodexThreadPage {
 
 export const threadKey = (threadId: string): string => `codex:${threadId}`;
 
-const RESUME_RETRY_MS = 3000;
-const RESUME_RETRY_MAX = 10;
 const RECONNECT_MIN_MS = 1000;
 const RECONNECT_MAX_MS = 30_000;
 // Discovery poll = the upper bound on the "approval fired before we
@@ -100,6 +98,7 @@ export function startCompanion(deps: CompanionDeps): Companion {
   let reconnectDelay = RECONNECT_MIN_MS;
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   let pollTimer: ReturnType<typeof setInterval> | undefined;
+  let polling = false;
   const lastMessages = new Map<string, string>();
   const retryAttempts = new Map<string, number>();
   const retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -118,6 +117,9 @@ export function startCompanion(deps: CompanionDeps): Companion {
   // Threads we've already (attempted to) resume on the current connection.
   // Cleared on disconnect — a reconnect doesn't preserve app-server subscriptions.
   let resumed = new Set<string>();
+  // `no rollout` is terminal for this app-server connection. Retrying it on
+  // every discovery poll only queues RPC work that can never succeed.
+  let noRollout = new Set<string>();
   /** threadId → 该 thread 的真实工作目录。来自 thread/resume 响应的 cwd
    *  (ThreadResumeResponse.cwd,见 app-server-protocol .../v2/thread.rs)。
    *  key 仍是 codex:<threadId>(唯一),cwd 才是真目录 —— registry 据此把
@@ -232,12 +234,10 @@ export function startCompanion(deps: CompanionDeps): Companion {
     return activeTurn?.id as string | undefined;
   }
 
-  function resumeThread(threadId: string, attempt = 1, force = false): void {
-    if (stopped || !rpc) return;
-    if (attempt === 1) {
-      if (!force && resumed.has(threadId)) return;
-      resumed.add(threadId);
-    }
+  function resumeThread(threadId: string, force = false): void {
+    if (stopped || !rpc || noRollout.has(threadId)) return;
+    if (!force && resumed.has(threadId)) return;
+    resumed.add(threadId);
     rpc.call('thread/resume', compactResumeParams(threadId)).then(
       (res) => {
         if (!force) captureResume(threadId, res, true);
@@ -248,14 +248,11 @@ export function startCompanion(deps: CompanionDeps): Companion {
       },
       (err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
-        if (/no rollout/i.test(msg) && attempt < RESUME_RETRY_MAX) {
-          const t = setTimeout(() => resumeThread(threadId, attempt + 1, force), RESUME_RETRY_MS);
-          t.unref?.();
-        } else {
-          log(`companion: resume ${threadId} failed: ${msg}`);
-          // 清除 resumed 去重集，以便后续轮询周期可以重新尝试该线程
-          resumed.delete(threadId);
-        }
+        if (/no rollout/i.test(msg)) noRollout.add(threadId);
+        log(`companion: resume ${threadId} failed: ${msg}`);
+        // Other transient failures may be retried on a later discovery poll.
+        // `no rollout` remains quarantined until reconnect resets connection state.
+        if (!noRollout.has(threadId)) resumed.delete(threadId);
       },
     );
   }
@@ -337,7 +334,8 @@ export function startCompanion(deps: CompanionDeps): Companion {
   }
 
   async function pollThreads(): Promise<void> {
-    if (stopped || !rpc) return;
+    if (stopped || !rpc || polling) return;
+    polling = true;
     try {
       const res = (await rpc.call('thread/loaded/list', {})) as { data?: string[] } | undefined;
       const ids = res?.data ?? [];
@@ -352,13 +350,15 @@ export function startCompanion(deps: CompanionDeps): Companion {
         for (const raw of listed.data) {
           const thread = readThreadSummary(raw);
           if (thread?.status.type === 'active' && thread.status.activeFlags.includes('waitingOnApproval')) {
-            resumeThread(thread.id, 1, true);
+            resumeThread(thread.id, true);
           }
         }
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       log(`companion: thread poll failed: ${msg}`);
+    } finally {
+      polling = false;
     }
   }
 
@@ -592,6 +592,8 @@ export function startCompanion(deps: CompanionDeps): Companion {
         rpc = undefined;
         stopPolling();
         resumed = new Set();
+        noRollout = new Set();
+        polling = false;
         deps.onStateChange?.('degraded');
         if (!stopped) scheduleReconnect();
       },

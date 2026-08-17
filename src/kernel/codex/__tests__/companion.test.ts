@@ -199,18 +199,15 @@ describe('companion', () => {
     comp.stop();
   });
 
-  it('resume retries on no-rollout then succeeds', async () => {
-    const calls: any[] = [];
+  it('quarantines a no-rollout thread until the companion reconnects', async () => {
     let events: any;
     let resumeAttempts = 0;
     const rpc = {
       call: vi.fn(async (method: string, params: any) => {
-        calls.push({ method, params });
         if (method === 'thread/loaded/list') return { data: ['t1'] };
         if (method === 'thread/resume') {
           resumeAttempts++;
-          if (resumeAttempts < 3) throw new Error('no rollout found for thread t1');
-          return { thread: { id: params.threadId } };
+          throw new Error('no rollout found for thread t1');
         }
         return {};
       }),
@@ -228,10 +225,15 @@ describe('companion', () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(resumeAttempts).toBe(1);
-    await vi.advanceTimersByTimeAsync(3000);
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(resumeAttempts).toBe(1);
+
+    events.onClose();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await Promise.resolve();
+    await Promise.resolve();
     expect(resumeAttempts).toBe(2);
-    await vi.advanceTimersByTimeAsync(3000);
-    expect(resumeAttempts).toBe(3);
     comp.stop();
   });
 
@@ -811,21 +813,17 @@ describe('companion', () => {
     comp.stop();
   });
 
-  it('a thread whose resume retries exhaust is retried again on a later poll', async () => {
-    const calls: any[] = [];
+  it('does not overlap slow discovery polls', async () => {
+    let threadListCalls = 0;
     let events: any;
-    let resumeAttempts = 0;
-    let shouldSucceed = false;
+    let releaseThreadList: (() => void) | undefined;
     const rpc = {
       call: vi.fn(async (method: string, params: any) => {
-        calls.push({ method, params });
-        if (method === 'thread/loaded/list') return { data: ['t2'] };
-        if (method === 'thread/resume') {
-          resumeAttempts++;
-          // Fail with 'no rollout' for first 10 attempts (RESUME_RETRY_MAX),
-          // then succeed on attempt 11 (after poll triggers fresh retry)
-          if (!shouldSucceed) throw new Error('no rollout found for thread t2');
-          return { thread: { id: params.threadId } };
+        if (method === 'thread/loaded/list') return { data: [] };
+        if (method === 'thread/list') {
+          threadListCalls++;
+          if (threadListCalls === 1) return { data: [] };
+          return new Promise((resolve) => { releaseThreadList = () => resolve({ data: [] }); });
         }
         return {};
       }),
@@ -843,28 +841,18 @@ describe('companion', () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    // Initial connect + poll should trigger first resume attempt
-    expect(resumeAttempts).toBe(1);
+    expect(threadListCalls).toBe(1);
+    await vi.advanceTimersByTimeAsync(5_000);
+    await Promise.resolve();
+    expect(threadListCalls).toBe(2);
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(threadListCalls).toBe(2);
 
-    // Exhaust all RESUME_RETRY_MAX (10) retries: each at 3000ms intervals
-    // Attempts 2-10 (9 retries after initial)
-    for (let i = 0; i < 9; i++) {
-      await vi.advanceTimersByTimeAsync(3000);
-      await Promise.resolve();
-      await Promise.resolve();
-    }
-    expect(resumeAttempts).toBe(10);
-
-    // Now allow resume to succeed
-    shouldSucceed = true;
-
-    // Advance to the next poll cycle (polls run every 5s; retries ended at 27s, next poll at 30s)
-    // This poll will call resumeThread again since we deleted from resumed set on final failure
-    await vi.advanceTimersByTimeAsync(3000);
+    releaseThreadList?.();
     await Promise.resolve();
     await Promise.resolve();
-    // At time 30s, poll should trigger and make attempt 11
-    expect(resumeAttempts).toBe(11);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(threadListCalls).toBe(3);
 
     comp.stop();
   });

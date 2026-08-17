@@ -27,6 +27,13 @@ describe('excerptForCard', () => {
     expect(out).toContain('*[+2 more lines]*');
   });
 
+  it('keeps all fenced-code lines when the channel can render them', () => {
+    const code = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'].join('\n');
+    const out = excerptForCard('X:\n\n```\n' + code + '\n```', 3500, Infinity);
+    expect(out).toContain('`h`');
+    expect(out).not.toContain('more lines');
+  });
+
   it('flattens tables into compact rows and drops the separator line', () => {
     const md = '| Where | Now |\n|---|---|\n| tag | old |';
     expect(excerptForCard(md)).toBe('Where · Now\ntag · old');

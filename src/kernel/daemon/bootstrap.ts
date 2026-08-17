@@ -216,8 +216,8 @@ export function createPendingCodexTurnStore(path: string): {
 /** 续跑卡 body:成功摘录进 expandable 引用块；失败错误直接显示。
  *  body 前导 \n 是有意的 —— renderCard 只在 title 后放一个换行,这一个
  *  额外换行就是标题与正文之间的那道留白。 */
-export function buildContinueCardBody(lastMessage: string, failed = false, includeReplyHint = true): string {
-  const ex = excerptForCard(lastMessage ?? '');
+export function buildContinueCardBody(lastMessage: string, failed = false, includeReplyHint = true, preserveFenceLines = false): string {
+  const ex = excerptForCard(lastMessage ?? '', undefined, preserveFenceLines ? Infinity : undefined);
   const quote = ex ? (failed ? `${ex}\n\n` : ex.split('\n').map((l) => `>! ${l}`).join('\n') + '\n\n') : '';
   return `\n${quote}${includeReplyHint ? '*Reply to this message to continue.*' : ''}`.trimEnd();
 }
@@ -836,7 +836,7 @@ export async function bootstrapDaemon(opts: BootstrapOpts): Promise<DaemonHandle
       // requestId 不进显示文本:回复路由走 replyToMessageId,不解析正文。
       const raw = req.context === TURN_FINISHED_SENTINEL ? '' : req.context;
       const title = req.failed ? 'Turn failed' : 'Turn finished';
-      const body = buildContinueCardBody(raw, req.failed, t.channel !== 'feishu');
+      const body = buildContinueCardBody(raw, req.failed, t.channel !== 'feishu', t.channel === 'feishu');
       const adapter = (opts.imAdapters ?? []).find((a) => a.channel === t.channel);
       const cardKey = `${req.cwd}\u0000${t.channel}\u0000${t.chatId}`;
       const current: ContinueCard = {

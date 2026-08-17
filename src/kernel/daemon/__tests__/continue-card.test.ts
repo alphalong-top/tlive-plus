@@ -30,4 +30,11 @@ describe('buildContinueCardBody', () => {
     expect(body).toContain('>! **T**');
     expect(body).toContain('>! `ls`');
   });
+
+  it('keeps complete code blocks for the Feishu card path', () => {
+    const code = Array.from({ length: 8 }, (_, i) => `line${i + 1}`).join('\n');
+    const body = buildContinueCardBody('```\n' + code + '\n```', false, false, true);
+    expect(body).toContain('>! `line8`');
+    expect(body).not.toContain('more lines');
+  });
 });

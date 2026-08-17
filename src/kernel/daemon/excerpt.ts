@@ -42,14 +42,14 @@ function breakAtEnd(s: string, max: number): string {
   return cut;
 }
 
-export function excerptForCard(md: string, budget = DEFAULT_BUDGET): string {
+export function excerptForCard(md: string, budget = DEFAULT_BUDGET, fenceKeepLines = FENCE_KEEP_LINES): string {
   // 代码块 → 逐行 inline code。整块丢弃会让引导语("Looks like:")变成
   // 没有下文的孤儿句(原型实测踩过)。
   let s = md.replace(/```[^\n]*\n([\s\S]*?)```/g, (_m, code: string) => {
     const lines = code.replace(/\n$/, '').split('\n').filter((l) => l.trim());
     if (!lines.length) return '';
-    const keep = lines.slice(0, FENCE_KEEP_LINES).map((l) => '`' + l.replace(/`/g, "'") + '`').join('\n');
-    return lines.length <= FENCE_KEEP_LINES ? keep : `${keep}\n*[+${lines.length - FENCE_KEEP_LINES} more lines]*`;
+    const keep = lines.slice(0, fenceKeepLines).map((l) => '`' + l.replace(/`/g, "'") + '`').join('\n');
+    return lines.length <= fenceKeepLines ? keep : `${keep}\n*[+${lines.length - fenceKeepLines} more lines]*`;
   });
   // 表格 → 紧凑行(窄屏上管道符会折成一坨)。分隔行连同换行一起删,否则留下空行。
   s = s.replace(/^[ \t]*\|[ \t|:-]+\|[ \t]*\n?/gm, '');
